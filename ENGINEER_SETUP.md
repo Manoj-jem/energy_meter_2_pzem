@@ -225,11 +225,6 @@ AWS IoT console (account **481665103941**, region **ap-south-1**) → **MQTT tes
 client** → subscribe to `energy_meter_002/data`. Frames should appear every
 ~2 seconds (`SEND_INTERVAL_MS`).
 
-> **Known gap:** the backend (`energy_meter_backend_iot`) still subscribes on
-> account 571751567031 and will **not** see this data until it is pointed at
-> `a3nyhs5ft5gkz6-ats.iot.ap-south-1.amazonaws.com` with its own subscriber
-> certificate. Confirm in the AWS console, not in the dashboard.
-
 ---
 
 ## Step 10 — PZEM meters

@@ -1,0 +1,36 @@
+// ================================================================
+// pzem_reading.proto  –  Protobuf schema for PZEM sensor data
+//
+// This is the SOURCE definition. The two generated files
+// (pzem_reading.pb.h and pzem_reading.pb.c) are already included
+// in the proto/ folder — you do NOT need to run protoc unless
+// you change this schema.
+//
+// To regenerate if you change this file:
+//   1. Install nanopb: pip install nanopb
+//   2. Run: python -m nanopb.generator.nanopb_generator pzem_reading.proto
+//   3. Copy the generated .pb.h and .pb.c into proto/ folder
+// ================================================================
+
+syntax = "proto3";
+
+// One reading from a single PZEM module
+message PzemChannel {
+    float   voltage      = 1;   // Volts
+    float   current      = 2;   // Amps
+    float   power        = 3;   // Watts
+    float   energy       = 4;   // Wh
+    float   frequency    = 5;   // Hz
+    float   power_factor = 6;   // 0.00–1.00
+    bool    alarm        = 7;   // true if over power threshold
+    bool    valid        = 8;   // false if read failed
+}
+
+// Top-level message containing all 3 channels
+message PzemPayload {
+    string      device_id = 1;  // e.g. "ESP32_PZEM_NODE_01"
+    uint32      timestamp = 2;  // seconds since boot (or Unix ts if RTC added)
+    PzemChannel pzem1     = 3;
+    PzemChannel pzem2     = 4;
+    PzemChannel pzem3     = 5;
+}

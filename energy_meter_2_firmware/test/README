@@ -1,0 +1,24 @@
+# Energy Meter with AWS IoT
+
+## Setup Instructions
+
+### 1. Get AWS IoT Certificates
+1. Go to AWS IoT Core Console
+2. Create a thing named "energy_meter_002"
+3. Download the certificates:
+   - aws_root_ca.pem
+   - aws_client_cert.pem
+   - aws_client_key.pem
+
+### 2. Update Certificate Files
+Replace the placeholder certificates in `src/certs.h` with your actual certificates:
+- Keep the exact format with `\n` at the end of each line
+- Copy the entire certificate including BEGIN/END lines
+
+### 3. Configure WiFi (if needed)
+Update `config.h` with your WiFi credentials (if using WiFi)
+
+### 4. Configure AWS IoT
+Update `config.h` with your AWS IoT endpoint:
+```cpp
+#define MQTT_BROKER_HOST "a3nyhs5ft5gkz6-ats.iot.ap-south-1.amazonaws.com"

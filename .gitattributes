@@ -1,0 +1,14 @@
+# Keep certificate material byte-identical on every machine.
+#
+# Without this, git checks PEMs out with CRLF on Windows, so the same file is
+# 1206 bytes on one engineer's laptop and 1187 on another's. gen_certs.py
+# normalises line endings before emitting certs_generated.h, so the firmware is
+# correct either way -- but the byte counts printed during provisioning would
+# not match the docs, which is exactly the sort of discrepancy that costs an
+# afternoon during bring-up.
+*.pem   text eol=lf
+*.crt   text eol=lf
+*.key   text eol=lf
+
+# Generated header is always LF (gen_certs.py writes newline="\n").
+certs_generated.h text eol=lf

@@ -1,7 +1,9 @@
 
 #include <Arduino.h>
+#include <Preferences.h>
 #include "config.h"
 #include "at_mqtt.h"
+#include "certs_generated.h"
 
 static HardwareSerial gsm(1);
 static volatile bool _connected  = false;
@@ -142,36 +144,145 @@ static bool _at_cmd_two_stage(const char* cmd, const char* urcPrefix,
     return false;
 }
 
+// ── Modem certificate store ─────────────────────────────────────────
+//
 // AT+CSSLCFG="cacert"/"clientcert"/"clientkey" only record a filename; they
 // return OK whether or not the file exists in the module's cert store. A
-// missing or misnamed file surfaces much later as CMQTTCONNECT err=32
-// (handshake fail), which is near-impossible to read. Check up front.
-static bool _verify_cert_store() {
+// missing, misnamed or *stale* file surfaces much later as CMQTTCONNECT
+// err=32 (handshake fail), which says nothing about which of a dozen causes
+// it was. So the firmware owns the cert store outright: it checks what is
+// there on every connect attempt and uploads the PEMs compiled into this
+// build whenever they don't match.
+
+// AT+CCERTLIST reports filenames only, never content, so a modem holding the
+// WRONG certificate under the RIGHT filename is otherwise undetectable — the
+// exact failure that stalled bring-up. Record which certificate we wrote, and
+// re-provision when the build's certificate differs from it.
+static const char* NVS_NAMESPACE   = "certs";
+static const char* NVS_KEY_FP      = "fp";
+
+static bool _cert_list(bool* haveCa, bool* haveCert, bool* haveKey) {
+    *haveCa = *haveCert = *haveKey = false;
+
     while (gsm.available()) gsm.read();
     DBGLN("[AT] >> AT+CCERTLIST");
     gsm.print("AT+CCERTLIST\r\n");
 
-    bool haveCa = false, haveCert = false, haveKey = false;
+    bool done = false;
     char line[256];
     uint32_t deadline = millis() + AT_DEFAULT_TIMEOUT_MS;
-    while (millis() < deadline) {
+    while (millis() < deadline && !done) {
         if (!_read_line(line, sizeof(line), 200)) continue;
-        if (strstr(line, CERT_FILENAME_CA))   haveCa   = true;
-        if (strstr(line, CERT_FILENAME_CERT)) haveCert = true;
-        if (strstr(line, CERT_FILENAME_KEY))  haveKey  = true;
-        if (strstr(line, "OK") || strstr(line, "ERROR")) break;
+        if (strstr(line, CERT_FILENAME_CA))   *haveCa   = true;
+        if (strstr(line, CERT_FILENAME_CERT)) *haveCert = true;
+        if (strstr(line, CERT_FILENAME_KEY))  *haveKey  = true;
+        if (strstr(line, "OK") || strstr(line, "ERROR")) done = true;
+    }
+    return done;
+}
+
+// AT+CCERTDOWN=<name>,<len> -> ">" prompt -> exactly <len> raw bytes -> OK.
+static bool _cert_download(const char* filename, const char* pem, size_t len) {
+    char cmd[96];
+
+    // A file already under this name would otherwise be kept; the modem does
+    // not overwrite. ERROR here just means "nothing to delete" — not a failure.
+    snprintf(cmd, sizeof(cmd), "AT+CCERTDELE=\"%s\"", filename);
+    _at_cmd(cmd, AT_DEFAULT_TIMEOUT_MS);
+
+    snprintf(cmd, sizeof(cmd), "AT+CCERTDOWN=\"%s\",%u", filename, (unsigned)len);
+    while (gsm.available()) gsm.read();
+    DBG("[AT] >> "); DBGLN(cmd);
+    gsm.print(cmd); gsm.print("\r\n");
+
+    bool gotPrompt = false;
+    uint32_t deadline = millis() + AT_DEFAULT_TIMEOUT_MS;
+    while (millis() < deadline && !gotPrompt) {
+        if (gsm.available() && (char)gsm.read() == '>') gotPrompt = true;
+    }
+    if (!gotPrompt) {
+        DBGF("[CERT] %s: no '>' prompt\n", filename);
+        return false;
     }
 
-    if (haveCa && haveCert && haveKey) {
-        DBGLN("[MQTT] Cert store OK — all three files present");
+    DBGF("[CERT] %s: writing %u bytes...\n", filename, (unsigned)len);
+    gsm.write((const uint8_t*)pem, len);
+    gsm.flush();   // drain the ESP32 TX FIFO before waiting on the reply
+
+    char line[256];
+    deadline = millis() + AT_PUB_TIMEOUT_MS;   // flash write can take seconds
+    while (millis() < deadline) {
+        if (!_read_line(line, sizeof(line), 200)) continue;
+        if (strstr(line, "OK"))    { DBGF("[CERT] %s: stored\n", filename); return true; }
+        if (strstr(line, "ERROR")) break;
+    }
+    DBGF("[CERT] %s: write FAILED\n", filename);
+    return false;
+}
+
+bool at_mqtt_provision_certs() {
+    Preferences prefs;
+    char storedFp[80] = {0};
+    if (prefs.begin(NVS_NAMESPACE, true)) {          // read-only
+        prefs.getString(NVS_KEY_FP, storedFp, sizeof(storedFp));
+        prefs.end();
+    }
+
+    bool haveCa, haveCert, haveKey;
+    if (!_cert_list(&haveCa, &haveCert, &haveKey)) {
+        DBGLN("[CERT] AT+CCERTLIST gave no reply — modem not ready");
+        return false;
+    }
+
+    const bool allPresent = haveCa && haveCert && haveKey;
+    const bool fpMatches  = (strcmp(storedFp, CLIENT_CERT_SHA256) == 0);
+
+    if (allPresent && fpMatches) {
+        DBGF("[CERT] Store OK — %s serial=%s\n", CERT_DEVICE_NAME, CLIENT_CERT_SERIAL);
+        DBGF("[CERT]   fingerprint %s\n", CLIENT_CERT_SHA256);
         return true;
     }
-    DBGF("[MQTT] *** CERT STORE INCOMPLETE *** ca(%s)=%s cert(%s)=%s key(%s)=%s\n",
-         CERT_FILENAME_CA,   haveCa   ? "found" : "MISSING",
-         CERT_FILENAME_CERT, haveCert ? "found" : "MISSING",
-         CERT_FILENAME_KEY,  haveKey  ? "found" : "MISSING");
-    DBGLN("[MQTT] Upload with AT+CCERTDOWN before the handshake can succeed");
-    return false;
+
+    DBGLN("[CERT] *** RE-PROVISIONING MODEM CERT STORE ***");
+    if (!allPresent) {
+        DBGF("[CERT]   reason: files missing — ca(%s)=%s cert(%s)=%s key(%s)=%s\n",
+             CERT_FILENAME_CA,   haveCa   ? "found" : "MISSING",
+             CERT_FILENAME_CERT, haveCert ? "found" : "MISSING",
+             CERT_FILENAME_KEY,  haveKey  ? "found" : "MISSING");
+    } else {
+        DBGF("[CERT]   reason: stale certificate on modem\n");
+        DBGF("[CERT]     modem has : %s\n", storedFp[0] ? storedFp : "(never provisioned by this firmware)");
+        DBGF("[CERT]     build has : %s\n", CLIENT_CERT_SHA256);
+    }
+    DBGF("[CERT]   uploading %s serial=%s valid %s -> %s\n",
+         CERT_DEVICE_NAME, CLIENT_CERT_SERIAL,
+         CLIENT_CERT_NOT_BEFORE, CLIENT_CERT_NOT_AFTER);
+
+    bool ok = _cert_download(CERT_FILENAME_CA,   ROOT_CA_PEM,     ROOT_CA_PEM_LEN);
+    ok = _cert_download(CERT_FILENAME_CERT, CLIENT_CERT_PEM, CLIENT_CERT_PEM_LEN) && ok;
+    ok = _cert_download(CERT_FILENAME_KEY,  CLIENT_KEY_PEM,  CLIENT_KEY_PEM_LEN)  && ok;
+    if (!ok) {
+        DBGLN("[CERT] One or more uploads failed — cert store not usable");
+        return false;
+    }
+
+    // Trust the modem's own listing, not our three OKs, before recording success.
+    if (!_cert_list(&haveCa, &haveCert, &haveKey) || !(haveCa && haveCert && haveKey)) {
+        DBGLN("[CERT] Verification listing incomplete after upload");
+        return false;
+    }
+
+    if (prefs.begin(NVS_NAMESPACE, false)) {         // read-write
+        prefs.putString(NVS_KEY_FP, CLIENT_CERT_SHA256);
+        prefs.end();
+    } else {
+        // Not fatal: the certs are on the modem and this connect will work.
+        // It only means the next boot re-uploads them instead of skipping.
+        DBGLN("[CERT] Warning: could not persist fingerprint to NVS");
+    }
+
+    DBGF("[CERT] Provisioned OK — fingerprint %s\n", CLIENT_CERT_SHA256);
+    return true;
 }
 
 static void _mqtt_teardown() {
@@ -232,7 +343,16 @@ bool at_mqtt_connect() {
 
     _mqtt_teardown();
 
-    _verify_cert_store();
+    // Blocking: without a usable cert store the handshake cannot succeed, so
+    // fail fast and let networkTask's backoff retry rather than burning the
+    // 20 s CMQTTCONNECT timeout on a connection that is already doomed.
+    if (!at_mqtt_provision_certs()) {
+        DBGLN("[MQTT] Cert store not usable — aborting connect attempt");
+        return false;
+    }
+
+    DBGF("[MQTT] Identity: client_id=%s thing=%s device_id=%s topic=%s\n",
+         MQTT_CLIENT_ID, AWS_THING_NAME, DEVICE_ID, MQTT_TOPIC_PUB);
 
     DBGLN("[MQTT] Configuring SSL (mTLS)...");
     // 3 = TLS 1.2 only. "4" (ALL) lets the module offer SSLv3/TLS1.0 in the
@@ -241,8 +361,11 @@ bool at_mqtt_connect() {
     if (!_at_cmd("AT+CSSLCFG=\"authmode\",0,2",     AT_DEFAULT_TIMEOUT_MS)) return false;
     if (!_at_cmd("AT+CSSLCFG=\"enableSNI\",0,1",    AT_DEFAULT_TIMEOUT_MS)) return false;
     // Without NITZ the modem RTC can sit in the past, which fails the server
-    // cert's validity window. Not fatal if the module rejects the option.
+    // cert's validity window and also presents as err 32. "ignorelocaltime" is
+    // the SIM7600 spelling, "ignorertctime" the A76XX (A7670C/SIM7670C) one —
+    // send both, non-fatal, and let the module ignore whichever it lacks.
     _at_cmd("AT+CSSLCFG=\"ignorelocaltime\",0,1",   AT_DEFAULT_TIMEOUT_MS);
+    _at_cmd("AT+CSSLCFG=\"ignorertctime\",0,1",     AT_DEFAULT_TIMEOUT_MS);
 
     snprintf(cmdBuf, sizeof(cmdBuf), "AT+CSSLCFG=\"cacert\",0,\"%s\"",     CERT_FILENAME_CA);
     if (!_at_cmd(cmdBuf, AT_DEFAULT_TIMEOUT_MS)) { DBGLN("[MQTT] cacert failed");     return false; }
@@ -275,6 +398,22 @@ bool at_mqtt_connect() {
     }
     if (err != 0) {
         DBGF("[MQTT] Connect failed err=%d (%s)\n", err, at_mqtt_err_string(err));
+        // err 32/33/34 all mean "the TLS handshake never completed", which has
+        // several unrelated causes the modem cannot distinguish. Spell them out
+        // so the next serial log is self-diagnosing.
+        if (err == 32 || err == 33 || err == 34) {
+            DBGLN("[MQTT]   TLS failed before MQTT started. Check, in order:");
+            DBGF ("[MQTT]     1. cert on modem = %s (this build)\n", CLIENT_CERT_SHA256);
+            DBGLN("[MQTT]        compare with the AWS IoT console's certificate fingerprint");
+            DBGLN("[MQTT]     2. that certificate is ACTIVE and attached to a policy AND the thing");
+            DBGF ("[MQTT]     3. modem clock — cert is not valid before %s\n", CLIENT_CERT_NOT_BEFORE);
+            DBGLN("[MQTT]     4. endpoint is the -ats endpoint (chains to Amazon Root CA 1)");
+        } else if (err == 30 || err == 31) {
+            DBGLN("[MQTT]   TLS succeeded; the BROKER rejected the CONNECT. This is a");
+            DBGLN("[MQTT]   policy/identity problem, not a certificate problem:");
+            DBGF ("[MQTT]     client_id '%s' must match the thing name the IoT policy\n", MQTT_CLIENT_ID);
+            DBGLN("[MQTT]     scopes iot:Connect to (client/${iot:Connection.Thing.ThingName})");
+        }
         return false;
     }
 

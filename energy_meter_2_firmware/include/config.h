@@ -6,6 +6,20 @@
 // config.h 
 // ================================================================
 
+// ── Device identity ──────────────────────────────────────────────
+// Two DIFFERENT names, deliberately. They are not interchangeable:
+//
+//   AWS_THING_NAME is the AWS IoT *thing*. The IoT policy scopes
+//   iot:Connect to client/${iot:Connection.Thing.ThingName}, so the MQTT
+//   client ID must match it character for character or the broker denies
+//   the CONNECT *after* a successful TLS handshake.
+//
+//   DEVICE_ID is the backend's identity for this meter. mqtt_worker.py
+//   subscribes to "+/data" and takes device_id from the topic prefix, then
+//   looks it up in the device registry. Changing DEVICE_ID without adding
+//   the matching backend rows (devices, device_profile, device_ct_config)
+//   sends every reading to S3 under unmapped/.
+#define AWS_THING_NAME      "energy-meter-002"
 #define DEVICE_ID           "energy_meter_002"
 #define FIRMWARE_VERSION    "1.0.0"
 
@@ -40,13 +54,30 @@
 #define APN_USER            ""
 #define APN_PASS            ""
 
-#define MQTT_BROKER_HOST    "a1d3i8d08oi632-ats.iot.ap-south-1.amazonaws.com"
+// AWS account 481665103941, ap-south-1 — the account that ISSUED the
+// certificate in ../certs/energy-meter-002/. This is not a free choice: a
+// client certificate from one AWS account presented to a different account's
+// broker can never authenticate, and the modem reports that only as
+// CMQTTCONNECT err=32, indistinguishable from a missing cert file.
+//
+// The previous value was a1d3i8d08oi632-ats — account 571751567031, where
+// energy_meter_001 lives. That mismatch, not the certificate files, is why
+// this device never connected.
+//
+// NOTE: energy_meter_backend_iot still subscribes on 571751567031
+// (app/services/mqtt_worker.py, AWS_IOT_ENDPOINT). Until it also points here,
+// meter 002's data will reach AWS but not the backend. See ../CERTIFICATES.md.
+#define MQTT_BROKER_HOST    "a3nyhs5ft5gkz6-ats.iot.ap-south-1.amazonaws.com"
 #define MQTT_BROKER_PORT    8883
 #define MQTT_USERNAME       ""
 #define MQTT_PASSWORD       ""
-#define MQTT_CLIENT_ID      "energy_meter_002"
-#define MQTT_TOPIC_PUB      "energy_meter_002/data"
-#define MQTT_TOPIC_SUB      "energy_meter_002/cmd"
+#define MQTT_CLIENT_ID      AWS_THING_NAME
+// Topics stay on DEVICE_ID so the existing backend registration keeps
+// working. If the IoT policy also scopes iot:Publish/iot:Subscribe to
+// topic/${iot:Connection.Thing.ThingName}/... rather than topic/*, these
+// must move to AWS_THING_NAME and the backend must register that id too.
+#define MQTT_TOPIC_PUB      DEVICE_ID "/data"
+#define MQTT_TOPIC_SUB      DEVICE_ID "/cmd"
 #define MQTT_QOS            1
 #define MQTT_KEEPALIVE_S    60
 

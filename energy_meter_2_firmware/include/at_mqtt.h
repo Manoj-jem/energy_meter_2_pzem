@@ -4,8 +4,14 @@
 // ================================================================
 #include <Arduino.h>
 
-bool gsm_modem_init();    
-bool at_mqtt_connect();      
+bool gsm_modem_init();
+
+// Brings the modem's certificate store in line with the PEMs compiled into
+// this build, uploading them via AT+CCERTDOWN when they are missing or stale.
+// Called automatically by at_mqtt_connect(); exposed for bring-up tools.
+bool at_mqtt_provision_certs();
+
+bool at_mqtt_connect();
 bool at_mqtt_publish(const char* payload);
 bool at_mqtt_subscribe();
 void at_mqtt_poll();

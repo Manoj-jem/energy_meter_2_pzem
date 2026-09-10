@@ -78,6 +78,22 @@ static bool _at_cmd(const char* cmd, uint32_t timeoutMs,
     return false;
 }
 
+static void _parse_urc_err(char* line, int* errOut) {
+    char* comma = strrchr(line, ',');
+    if (comma) {
+        *errOut = atoi(comma + 1);
+        return;
+    }
+    char* colon = strrchr(line, ':');
+    if (colon) {
+        char* p = colon + 1;
+        while (*p == ' ') p++;
+        *errOut = atoi(p);
+    } else {
+        *errOut = -1;
+    }
+}
+
 static bool _at_cmd_two_stage(const char* cmd, const char* urcPrefix,
                                uint32_t timeoutMs, int* errOut) {
     while (gsm.available()) gsm.read();
@@ -86,38 +102,75 @@ static bool _at_cmd_two_stage(const char* cmd, const char* urcPrefix,
 
     char line[256];
     uint32_t deadline = millis() + timeoutMs;
-    bool gotOk = false;
+    bool gotOk  = false;
+    bool gotUrc = false;
 
     while (millis() < deadline && !gotOk) {
         if (_read_line(line, sizeof(line), 200)) {
-            if (strstr(line, "ERROR")) { DBGLN("[AT] ERROR (stage 1)"); return false; }
-            if (strstr(line, "OK"))    gotOk = true;
+            // The URC can arrive *before* the final result code. A failed
+            // CMQTTCONNECT emits "+CMQTTCONNECT: 0,<err>" and then ERROR —
+            // capture the error code before the ERROR branch discards it,
+            // otherwise a real diagnosis is reported as "no response".
+            if (!gotUrc && strstr(line, urcPrefix)) {
+                _parse_urc_err(line, errOut);
+                gotUrc = true;
+            }
+            if (strstr(line, "ERROR")) {
+                if (gotUrc) {
+                    DBGF("[AT] ERROR after %s err=%d\n", urcPrefix, *errOut);
+                    return true;
+                }
+                DBGLN("[AT] ERROR (stage 1)");
+                return false;
+            }
+            if (strstr(line, "OK")) gotOk = true;
         }
     }
+    if (gotUrc) { DBGF("[AT] two-stage result: err=%d\n", *errOut); return true; }
     if (!gotOk) { DBGLN("[AT] No OK (stage 1 timeout)"); return false; }
 
     while (millis() < deadline) {
         if (_read_line(line, sizeof(line), 200)) {
             if (strstr(line, urcPrefix)) {
-                char* comma = strrchr(line, ',');
-                if (comma) {
-                    *errOut = atoi(comma + 1);
-                } else {
-                    char* colon = strrchr(line, ':');
-                    if (colon) {
-                        char* p = colon + 1;
-                        while (*p == ' ') p++;
-                        *errOut = atoi(p);
-                    } else {
-                        *errOut = -1;
-                    }
-                }
+                _parse_urc_err(line, errOut);
                 DBGF("[AT] two-stage result: err=%d\n", *errOut);
                 return true;
             }
         }
     }
     DBGF("[AT] Timeout for %s (stage 2)\n", urcPrefix);
+    return false;
+}
+
+// AT+CSSLCFG="cacert"/"clientcert"/"clientkey" only record a filename; they
+// return OK whether or not the file exists in the module's cert store. A
+// missing or misnamed file surfaces much later as CMQTTCONNECT err=32
+// (handshake fail), which is near-impossible to read. Check up front.
+static bool _verify_cert_store() {
+    while (gsm.available()) gsm.read();
+    DBGLN("[AT] >> AT+CCERTLIST");
+    gsm.print("AT+CCERTLIST\r\n");
+
+    bool haveCa = false, haveCert = false, haveKey = false;
+    char line[256];
+    uint32_t deadline = millis() + AT_DEFAULT_TIMEOUT_MS;
+    while (millis() < deadline) {
+        if (!_read_line(line, sizeof(line), 200)) continue;
+        if (strstr(line, CERT_FILENAME_CA))   haveCa   = true;
+        if (strstr(line, CERT_FILENAME_CERT)) haveCert = true;
+        if (strstr(line, CERT_FILENAME_KEY))  haveKey  = true;
+        if (strstr(line, "OK") || strstr(line, "ERROR")) break;
+    }
+
+    if (haveCa && haveCert && haveKey) {
+        DBGLN("[MQTT] Cert store OK — all three files present");
+        return true;
+    }
+    DBGF("[MQTT] *** CERT STORE INCOMPLETE *** ca(%s)=%s cert(%s)=%s key(%s)=%s\n",
+         CERT_FILENAME_CA,   haveCa   ? "found" : "MISSING",
+         CERT_FILENAME_CERT, haveCert ? "found" : "MISSING",
+         CERT_FILENAME_KEY,  haveKey  ? "found" : "MISSING");
+    DBGLN("[MQTT] Upload with AT+CCERTDOWN before the handshake can succeed");
     return false;
 }
 
@@ -179,10 +232,17 @@ bool at_mqtt_connect() {
 
     _mqtt_teardown();
 
+    _verify_cert_store();
+
     DBGLN("[MQTT] Configuring SSL (mTLS)...");
-    if (!_at_cmd("AT+CSSLCFG=\"sslversion\",0,4",  AT_DEFAULT_TIMEOUT_MS)) return false;
+    // 3 = TLS 1.2 only. "4" (ALL) lets the module offer SSLv3/TLS1.0 in the
+    // ClientHello, which AWS IoT rejects outright.
+    if (!_at_cmd("AT+CSSLCFG=\"sslversion\",0,3",   AT_DEFAULT_TIMEOUT_MS)) return false;
     if (!_at_cmd("AT+CSSLCFG=\"authmode\",0,2",     AT_DEFAULT_TIMEOUT_MS)) return false;
     if (!_at_cmd("AT+CSSLCFG=\"enableSNI\",0,1",    AT_DEFAULT_TIMEOUT_MS)) return false;
+    // Without NITZ the modem RTC can sit in the past, which fails the server
+    // cert's validity window. Not fatal if the module rejects the option.
+    _at_cmd("AT+CSSLCFG=\"ignorelocaltime\",0,1",   AT_DEFAULT_TIMEOUT_MS);
 
     snprintf(cmdBuf, sizeof(cmdBuf), "AT+CSSLCFG=\"cacert\",0,\"%s\"",     CERT_FILENAME_CA);
     if (!_at_cmd(cmdBuf, AT_DEFAULT_TIMEOUT_MS)) { DBGLN("[MQTT] cacert failed");     return false; }

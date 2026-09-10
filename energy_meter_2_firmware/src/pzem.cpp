@@ -31,6 +31,23 @@ static uint16_t crc16(const uint8_t* data, uint16_t len) {
     return crc;
 }
 
+// UART2 is shared by all three phases; .begin() with new pins reconfigures
+// the GPIO matrix in microseconds. Every transaction must bind first —
+// talking to a channel without binding hits whichever pins were left over.
+static bool bind_channel(uint8_t channel) {
+    pzemSerial1.end();
+    switch (channel) {
+        case 1: pzemSerial1.begin(PZEM_BAUD, SERIAL_8N1, PZEM1_RX_PIN, PZEM1_TX_PIN); break;
+        case 2: pzemSerial1.begin(PZEM_BAUD, SERIAL_8N1, PZEM2_RX_PIN, PZEM2_TX_PIN); break;
+        case 3: pzemSerial1.begin(PZEM_BAUD, SERIAL_8N1, PZEM3_RX_PIN, PZEM3_TX_PIN); break;
+        default:
+            DBGF("[PZEM] Invalid channel %d\n", channel);
+            return false;
+    }
+    delay(5);  // GPIO matrix settle time.
+    return true;
+}
+
 static Stream* get_serial(uint8_t channel) {
     (void)channel;
     return &pzemSerial1;
@@ -105,41 +122,7 @@ PzemReading pzem_read(uint8_t slaveAddr, uint8_t channel) {
     PzemReading result = {0};
     result.valid = false;
 
-    // Remap the single HardwareSerial UART2 to the correct pins
-    // before each read. .begin() with new pins reconfigures the
-    // GPIO matrix — takes microseconds, costs nothing.
-    pzemSerial1.end();
-    switch(channel){
-
-case 1:
-    pzemSerial1.begin(
-        PZEM_BAUD,
-        SERIAL_8N1,
-        PZEM1_RX_PIN,
-        PZEM1_TX_PIN
-    );
-    break;
-
-case 2:
-    pzemSerial1.begin(
-        PZEM_BAUD,
-        SERIAL_8N1,
-        PZEM2_RX_PIN,
-        PZEM2_TX_PIN
-    );
-    break;
-
-case 3:
-    pzemSerial1.begin(
-        PZEM_BAUD,
-        SERIAL_8N1,
-        PZEM3_RX_PIN,
-        PZEM3_TX_PIN
-    );
-    break;
-}
-
-    delay(5);  // GPIO matrix settle time.
+    if (!bind_channel(channel)) return result;
 
     Stream* s = get_serial(channel);
     if (!s) return result;
@@ -213,13 +196,15 @@ void pzem_read_all(PzemReading readings[3]) {
 }
  
 bool pzem_set_address(uint8_t channel, uint8_t oldAddr, uint8_t newAddr) {
-    Stream* s = get_serial(channel);
-    if (!s) return false;
-
     if (newAddr < 0x01 || newAddr > 0xF7) {
         DBGLN("[PZEM] Address out of range (0x01–0xF7)");
         return false;
     }
+
+    if (!bind_channel(channel)) return false;
+
+    Stream* s = get_serial(channel);
+    if (!s) return false;
 
     uint8_t request[6] = {
         oldAddr,

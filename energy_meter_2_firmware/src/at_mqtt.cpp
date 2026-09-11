@@ -542,22 +542,11 @@ bool at_mqtt_connect() {
     // serves the same chain as meter 001's (openssl s_client, 2026-09-11).
     // AWS does not reject a negotiating ClientHello.
     if (!_at_cmd("AT+CSSLCFG=\"sslversion\",0,4",   AT_DEFAULT_TIMEOUT_MS)) return false;
-    // ****************************************************************
-    // TEMPORARY DIAGNOSTIC -- authmode forced to 1 (server-auth only, no
-    // client certificate presented). This is NOT a fix and MUST be reverted
-    // to 2 afterwards: AWS IoT still will not accept the MQTT session without
-    // our client cert, so this is expected to fail regardless. The question
-    // it answers is WHERE it fails:
-    //   - err 32 again  -> the base TLS engine cannot complete even an
-    //     unauthenticated handshake with AWS; the client certificate/key are
-    //     not the issue at all.
-    //   - anything else (a different err code, or TLS succeeds and the
-    //     MQTT CONNECT itself is what fails) -> the base engine is fine, and
-    //     the fault is specifically in presenting our client certificate /
-    //     private key (authmode 2's extra step). That would point at a
-    //     corrupted key on the modem or an authmode=2-specific firmware bug.
-    // ****************************************************************
-    if (!_at_cmd("AT+CSSLCFG=\"authmode\",0,1",     AT_DEFAULT_TIMEOUT_MS)) return false;
+    // 2 = mutual TLS (client certificate required by AWS IoT on this port).
+    // A diagnostic run with this forced to 1 (server-auth only, no client
+    // cert presented) still failed with err 32 -- proof the certificate and
+    // key are not the cause. See at_mqtt_connect()'s err==32 branch below.
+    if (!_at_cmd("AT+CSSLCFG=\"authmode\",0,2",     AT_DEFAULT_TIMEOUT_MS)) return false;
     if (!_at_cmd("AT+CSSLCFG=\"enableSNI\",0,1",    AT_DEFAULT_TIMEOUT_MS)) return false;
     // Without NITZ the modem RTC can sit in the past, which fails the server
     // cert's validity window and also presents as err 32. "ignorelocaltime" is
@@ -601,6 +590,19 @@ bool at_mqtt_connect() {
         // several unrelated causes the modem cannot distinguish. Spell them out
         // so the next serial log is self-diagnosing.
         if (err == 32 || err == 33 || err == 34) {
+            // Diagnosed 2026-09-11 on this unit (A7670C-LNNV V11.0.01): err 32
+            // reproduces identically with authmode temporarily forced to 1
+            // (no client certificate presented at all), against an endpoint
+            // independently verified (openssl s_client, tools/iot_selftest.py)
+            // to serve a byte-identical TLS 1.2 handshake to a WORKING meter's
+            // account -- same chain, same ciphers, same TLS 1.1-1.3 support.
+            // So on this unit the certificate/key/policy/clock/account are NOT
+            // the cause; the failure is in this module's base TLS engine
+            // (likely its ECDHE handling or its 4-certificate chain
+            // verification) before a client certificate would ever matter.
+            // Items 1-4 below remain worth checking on a DIFFERENT unit or
+            // after a modem firmware update, but do not re-chase them on
+            // this one without new evidence.
             DBGLN("[MQTT]   TLS failed before MQTT started. Check, in order:");
             DBGF ("[MQTT]     1. cert on modem = %s (this build)\n", CLIENT_CERT_SHA256);
             DBGLN("[MQTT]        compare with the AWS IoT console's certificate fingerprint");

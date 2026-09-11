@@ -595,6 +595,55 @@ static bool _modem_resolve(const char* host, char* ip, size_t ipLen) {
     return false;
 }
 
+// Fetches https://tls.peet.ws/api/clean with the modem's own HTTPS client,
+// which uses the same TLS stack as CMQTT. The service answers with a
+// fingerprint of the ClientHello it just received (JA3: TLS version, cipher
+// suites, extensions, groups; peetprint: also signature algorithms), so the
+// modem's exact hello can be replayed with openssl against both AWS
+// endpoints. authmode 0: no certificate is sent, nothing else is transmitted.
+static char _diagBuf[2048];
+
+static void _diag_clienthello() {
+    DBGLN("[DIAG] Capturing this modem's TLS ClientHello via https://tls.peet.ws/api/clean");
+    _at_cmd("AT+HTTPTERM", 3000);                     // ERROR if not initialised: fine
+    if (!_at_cmd("AT+HTTPINIT", 5000)) { DBGLN("[DIAG] HTTPINIT failed - capture skipped"); return; }
+    _at_cmd("AT+CSSLCFG=\"authmode\",0,0", AT_DEFAULT_TIMEOUT_MS);
+    _at_cmd("AT+HTTPPARA=\"URL\",\"https://tls.peet.ws/api/clean\"", 5000);
+    _at_cmd("AT+HTTPPARA=\"SSLCFG\",0", 5000);       // use SSL context 0, as CMQTT does
+
+    int method = -1, status = -1, len = -1;
+    while (gsm.available()) gsm.read();
+    DBGLN("[AT] >> AT+HTTPACTION=0");
+    gsm.print("AT+HTTPACTION=0\r\n");
+    uint32_t deadline = millis() + 30000;
+    while (millis() < deadline) {
+        if (!_read_line(_diagBuf, sizeof(_diagBuf), 200)) continue;
+        const char* p = strstr(_diagBuf, "+HTTPACTION:");
+        if (p && sscanf(p + 12, " %d,%d,%d", &method, &status, &len) == 3) break;
+        if (strstr(_diagBuf, "ERROR")) break;
+    }
+    DBGF("[DIAG] HTTPS GET status=%d length=%d\n", status, len);
+
+    if (status == 200 && len > 0) {
+        char cmd[40];
+        snprintf(cmd, sizeof(cmd), "AT+HTTPREAD=0,%d", len > 1900 ? 1900 : len);
+        while (gsm.available()) gsm.read();
+        DBG("[AT] >> "); DBGLN(cmd);
+        gsm.print(cmd); gsm.print("\r\n");
+        deadline = millis() + 10000;
+        while (millis() < deadline) {                 // every line is echoed by _read_line
+            if (!_read_line(_diagBuf, sizeof(_diagBuf), 200)) continue;
+            if (strstr(_diagBuf, "+HTTPREAD: 0")) break;
+        }
+        DBGLN("[DIAG] ^ ClientHello fingerprint (ja3 / peetprint lines above) - send these");
+    } else if (status > 0) {
+        DBGF("[DIAG] HTTPS worked but returned status %d - capture incomplete\n", status);
+    } else {
+        DBGLN("[DIAG] HTTPS request failed - the modem's TLS could not reach tls.peet.ws either");
+    }
+    _at_cmd("AT+HTTPTERM", 3000);
+}
+
 static void _run_tls_diagnostics() {
     // meter 001's endpoint (AWS account 571751567031), where a device IS
     // connecting in production. Used only as a comparison target.
@@ -608,6 +657,21 @@ static void _run_tls_diagnostics() {
     char ip[64] = {0};
     const bool resolved = _modem_resolve(MQTT_BROKER_HOST, ip, sizeof(ip));
     DBGF("[DIAG] DNS: %s -> %s\n", MQTT_BROKER_HOST, resolved ? ip : "LOOKUP FAILED");
+
+    // G first, so the answer is near the top of the log: the full production
+    // connect (verify AWS + client cert) with SNI switched OFF. AWS requires
+    // an exact host_name in SNI on endpoints with a configured TLS policy
+    // (this account's iot:Data-ATS has one) and rejects a wrong one at the
+    // ClientHello -- but accepts no SNI at all. Meter 001's endpoint and
+    // test.mosquitto.org ignore SNI, which is why they connect.
+    _at_cmd("AT+CSSLCFG=\"enableSNI\",0,0", AT_DEFAULT_TIMEOUT_MS);
+    const int g = _diag_attempt("G: AWS, production certs, SNI OFF", aws, 1, 2);
+    _at_cmd("AT+CSSLCFG=\"enableSNI\",0,1", AT_DEFAULT_TIMEOUT_MS);
+
+    // The modem's exact ClientHello, so it can be replayed against AWS.
+    _mqtt_teardown();
+    esp_task_wdt_reset();
+    _diag_clienthello();
 
     const int a = _diag_attempt("A: AWS, client cert, AWS cert NOT checked",   aws, 1, 3);
     const int b = _diag_attempt("B: AWS, no certificates at all",               aws, 1, 0);
@@ -627,7 +691,11 @@ static void _run_tls_diagnostics() {
     _at_cmd("AT+CSSLCFG=\"authmode\",0,2", AT_DEFAULT_TIMEOUT_MS);
 
     DBGLN("[DIAG] ----- verdict -----");
-    if (a == 0) {
+    if (g == 0) {
+        DBGLN("[DIAG] G CONNECTED with SNI OFF. This modem sends a malformed SNI host name,");
+        DBGLN("[DIAG] which this AWS account's endpoint rejects. Certificates, clock and");
+        DBGLN("[DIAG] network are all fine. Fix: production connect with enableSNI = 0.");
+    } else if (a == 0) {
         DBGLN("[DIAG] A CONNECTED. AWS accepts this device's certificate and the link works.");
         DBGLN("[DIAG] The only failing step is the MODEM CHECKING AWS'S CERTIFICATE against");
         DBGLN("[DIAG] the CA file on the modem. Not the clock, not the device cert.");
@@ -654,8 +722,8 @@ static void _run_tls_diagnostics() {
         DBGLN("[DIAG] while another TLS server accepts it (D). AWS and this modem firmware");
         DBGLN("[DIAG] (see ATI) are incompatible; meter 001 must run different modem firmware.");
     }
-    DBGF("[DIAG] codes: A=%d B=%d C=%d D=%d E=%d F=%d  (0 = connected, -2 = not run)\n",
-         a, b, c, d, e, f);
+    DBGF("[DIAG] codes: G=%d A=%d B=%d C=%d D=%d E=%d F=%d  (0 = connected, -2 = not run)\n",
+         g, a, b, c, d, e, f);
     DBGLN("[DIAG] ==========================================================================");
 }
 

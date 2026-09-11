@@ -140,7 +140,7 @@ isn't being rewritten on every boot.
 | `[GSM] No AT response` | wiring (RX/TX swapped), module unpowered, or PWRKEY needed |
 | `[GSM] GPRS not attached` | SIM inactive, no data plan, wrong `APN`, or poor signal |
 | `[CERT] ... no '>' prompt` | module doesn't support `AT+CCERTDOWN` — check the model |
-| `Connect failed err=32` | TLS failed. Run `tools/iot_selftest.py`; the causes are listed there |
+| `Connect failed err=32` | TLS failed inside the modem. If `tools/iot_selftest.py` passes, the credentials and AWS are fine. After 2 failures in a row the firmware discards its cert record and re-uploads all three files on the next attempt (look for `RE-PROVISIONING`). If it still fails after that, send the `ATI` revision lines and the `+CCLK` line from the log |
 | `Connect failed err=30/31` | TLS fine, broker refused — policy/client-ID problem |
 | `[PZEM] chN: short response (0 bytes)` | nothing on that UART: 5 V missing, or RX/TX swapped |
 

@@ -161,6 +161,21 @@ static bool _at_cmd_two_stage(const char* cmd, const char* urcPrefix,
 static const char* NVS_NAMESPACE   = "certs";
 static const char* NVS_KEY_FP      = "fp";
 
+// Consecutive TLS handshake failures (err 32/33/34) since the last success.
+// The NVS fingerprint records which PEMs this firmware SENT, not that the
+// modem still holds them intact, so after TLS_FAILS_BEFORE_REUPLOAD failures
+// in a row the record is dropped and the next attempt rewrites all three.
+static uint8_t       _tlsFailStreak = 0;
+static const uint8_t TLS_FAILS_BEFORE_REUPLOAD = 2;
+
+static void _invalidate_cert_record() {
+    Preferences prefs;
+    if (prefs.begin(NVS_NAMESPACE, false)) {
+        prefs.remove(NVS_KEY_FP);
+        prefs.end();
+    }
+}
+
 static bool _cert_list(bool* haveCa, bool* haveCert, bool* haveKey) {
     *haveCa = *haveCert = *haveKey = false;
 
@@ -316,6 +331,7 @@ bool gsm_modem_init() {
     if (!awake) { DBGLN("[GSM] No AT response"); return false; }
 
     _at_cmd("AT+CMEE=2", AT_DEFAULT_TIMEOUT_MS);
+    _at_cmd("ATI", AT_DEFAULT_TIMEOUT_MS);   // model + firmware revision, for support logs
 
     DBGLN("[GSM] Waiting for GPRS...");
     bool attached = false;
@@ -355,9 +371,14 @@ bool at_mqtt_connect() {
          MQTT_CLIENT_ID, AWS_THING_NAME, DEVICE_ID, MQTT_TOPIC_PUB);
 
     DBGLN("[MQTT] Configuring SSL (mTLS)...");
-    // 3 = TLS 1.2 only. "4" (ALL) lets the module offer SSLv3/TLS1.0 in the
-    // ClientHello, which AWS IoT rejects outright.
-    if (!_at_cmd("AT+CSSLCFG=\"sslversion\",0,3",   AT_DEFAULT_TIMEOUT_MS)) return false;
+    // 4 = "ALL": the module negotiates, and against AWS IoT that lands on
+    // TLS 1.2. This is exactly what energy_meter_firmware (meter 001) sends in
+    // production on the same SIMCom module family. Forcing 3 (TLS 1.2 only)
+    // gave err 32 on every attempt during bring-up, against an endpoint that
+    // accepts every TLS 1.1/1.2 cipher, group and signature algorithm and
+    // serves the same chain as meter 001's (openssl s_client, 2026-09-11).
+    // AWS does not reject a negotiating ClientHello.
+    if (!_at_cmd("AT+CSSLCFG=\"sslversion\",0,4",   AT_DEFAULT_TIMEOUT_MS)) return false;
     if (!_at_cmd("AT+CSSLCFG=\"authmode\",0,2",     AT_DEFAULT_TIMEOUT_MS)) return false;
     if (!_at_cmd("AT+CSSLCFG=\"enableSNI\",0,1",    AT_DEFAULT_TIMEOUT_MS)) return false;
     // Without NITZ the modem RTC can sit in the past, which fails the server
@@ -408,6 +429,14 @@ bool at_mqtt_connect() {
             DBGLN("[MQTT]     2. that certificate is ACTIVE and attached to a policy AND the thing");
             DBGF ("[MQTT]     3. modem clock — cert is not valid before %s\n", CLIENT_CERT_NOT_BEFORE);
             DBGLN("[MQTT]     4. endpoint is the -ats endpoint (chains to Amazon Root CA 1)");
+            _at_cmd("AT+CCLK?", AT_DEFAULT_TIMEOUT_MS);   // modem clock, for item 3
+
+            if (++_tlsFailStreak >= TLS_FAILS_BEFORE_REUPLOAD) {
+                DBGF("[CERT] %u TLS failures in a row - discarding the NVS record so "
+                     "the next attempt re-uploads all three files\n", (unsigned)_tlsFailStreak);
+                _invalidate_cert_record();
+                _tlsFailStreak = 0;
+            }
         } else if (err == 30 || err == 31) {
             DBGLN("[MQTT]   TLS succeeded; the BROKER rejected the CONNECT. This is a");
             DBGLN("[MQTT]   policy/identity problem, not a certificate problem:");
@@ -418,6 +447,7 @@ bool at_mqtt_connect() {
     }
 
     DBGLN("[MQTT] Connected to AWS IoT");
+    _tlsFailStreak = 0;
     _connected  = true;
     _lastPingMs = millis();
     return true;

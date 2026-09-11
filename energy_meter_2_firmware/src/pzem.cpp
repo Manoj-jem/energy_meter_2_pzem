@@ -141,7 +141,13 @@ PzemReading pzem_read(uint8_t slaveAddr, uint8_t channel) {
         return result;
     }
 
-    if (response[0] != slaveAddr || response[1] != FUNC_READ_INPUT || response[2] != 20) {
+    // A query to the general address 0xF8 is answered with the unit's own
+    // configured address (0x01-0xF7), so only a specific query can demand an
+    // exact echo of the address byte.
+    const bool addrOk = (slaveAddr == PZEM_GENERAL_ADDR)
+                        ? (response[0] >= 0x01 && response[0] <= PZEM_GENERAL_ADDR)
+                        : (response[0] == slaveAddr);
+    if (!addrOk || response[1] != FUNC_READ_INPUT || response[2] != 20) {
         DBGF("[PZEM] CH%u: invalid header addr=0x%02X func=0x%02X bytes=%u\n",
              channel, response[0], response[1], response[2]);
         unbind_pzem();
@@ -168,8 +174,8 @@ PzemReading pzem_read(uint8_t slaveAddr, uint8_t channel) {
     result.alarm = (alarm_raw == 0xFFFF);
     result.valid = true;
 
-    DBGF("[PZEM] CH%u OK: V=%.1fV I=%.3fA P=%.1fW E=%.0fWh F=%.1fHz PF=%.2f\n",
-         channel, result.voltage, result.current, result.power,
+    DBGF("[PZEM] CH%u OK (unit addr 0x%02X): V=%.1fV I=%.3fA P=%.1fW E=%.0fWh F=%.1fHz PF=%.2f\n",
+         channel, response[0], result.voltage, result.current, result.power,
          result.energy, result.frequency, result.power_factor);
 
     unbind_pzem();
@@ -214,7 +220,7 @@ bool pzem_set_address(uint8_t channel, uint8_t oldAddr, uint8_t newAddr) {
     uint8_t response[8] = {};
     const uint8_t rxLen = recv_frame(response, sizeof(response), 8);
     const bool ok = rxLen == 8 &&
-                    response[0] == oldAddr &&
+                    (oldAddr == PZEM_GENERAL_ADDR || response[0] == oldAddr) &&
                     response[1] == FUNC_WRITE_REG &&
                     response[2] == (uint8_t)(REG_ADDR_PARAM >> 8) &&
                     response[3] == (uint8_t)(REG_ADDR_PARAM & 0xFF) &&

@@ -33,9 +33,16 @@
 #define PZEM2_TX_PIN        5
 #define PZEM3_RX_PIN        18
 #define PZEM3_TX_PIN        19
-#define PZEM1_ADDR          0x01
-#define PZEM2_ADDR          0x02
-#define PZEM3_ADDR          0x03
+// Each PZEM has its OWN RX/TX pin pair (UART2 is re-pointed per read), so
+// every bus carries exactly one unit and they need no distinct Modbus
+// addresses. Query them on the PZEM-004T v3.0 general address 0xF8, which a
+// unit answers whatever address it is configured with. New units ship as
+// 0x01: the old 0x01/0x02/0x03 scheme only worked if channels 2 and 3 had
+// been re-programmed, and otherwise timed out ("received 0/25 bytes").
+#define PZEM_GENERAL_ADDR   0xF8
+#define PZEM1_ADDR          PZEM_GENERAL_ADDR
+#define PZEM2_ADDR          PZEM_GENERAL_ADDR
+#define PZEM3_ADDR          PZEM_GENERAL_ADDR
 #define PZEM_TIMEOUT_MS     500
 
 // Phase 1 production storage and power-state signals.

@@ -242,14 +242,19 @@ isn't being rewritten every boot.
 
 ## Step 10 — PZEM meters
 
-If readings show `[PZEM] chN: short response (0 bytes)`, nothing is driving that
-UART: check 5 V on the PZEM's 4-pin TTL header (not the mains terminals), the
-shared ground, and RX/TX orientation.
+No PZEM address programming is needed. Each unit has its own RX/TX pins and
+is queried on the general address `0xF8`, which a PZEM-004T v3.0 answers
+whatever address it is set to (new units ship as `0x01`). A working channel
+logs:
 
-New PZEM-004T v3.0 units all ship as address `0x01`, so channels 2 and 3 must be
-programmed once — see [FLASHING.md §6](FLASHING.md). To identify a unit whose
-address you don't know, probe `0xF8`: v3.0 units answer on it regardless of
-their configured address, which separates "not wired" from "wrong address".
+```
+[PZEM] CH2 OK (unit addr 0x01): V=230.1V I=0.412A ...
+```
+
+If a channel logs `[PZEM] Timeout: received 0/25 bytes`, nothing is answering
+on that pin pair. That is wiring, not addressing: check 5 V on the PZEM's
+4-pin TTL header (not the mains terminals), the shared ground, and that the
+PZEM's TX goes to the ESP32 RX pin for that channel (see FLASHING.md §1).
 
 ---
 

@@ -48,9 +48,13 @@ Insert a **data-enabled** SIM with an active plan. `APN` in `config.h` is
 
 | Channel | ESP32 RX | ESP32 TX | Modbus addr |
 |---|---|---|---|
-| 1 | GPIO16 | GPIO17 | 0x01 |
-| 2 | GPIO4 | GPIO5 | 0x02 |
-| 3 | GPIO18 | GPIO19 | 0x03 |
+| 1 | GPIO16 | GPIO17 | 0xF8 (general) |
+| 2 | GPIO4 | GPIO5 | 0xF8 (general) |
+| 3 | GPIO18 | GPIO19 | 0xF8 (general) |
+
+Each PZEM is alone on its own pin pair, so all three are queried on the
+general address `0xF8`. They answer it whatever address they are set to, so
+new units (factory address `0x01`) work without any programming.
 
 Each PZEM's TTL header needs **5 V** on its VCC pin (the 4-pin side header, not
 the mains terminals) and a common ground with the ESP32. The TTL side is
@@ -150,12 +154,19 @@ running rather than resetting.
 
 ## 6. Setting the PZEM Modbus addresses
 
-New PZEM-004T units all ship as address `0x01`, so channels 2 and 3 must be
-programmed once before they can share a bus layout. Use
-`pzem_set_address(channel, oldAddr, newAddr)` from `src/pzem.h`, one unit at a
-time. To find a unit whose address you don't know, probe `0xF8` — v3.0 units
-answer on it regardless of their configured address, which distinguishes "not
-wired" from "wrong address".
+**Not needed.** Every PZEM has its own RX/TX pins, and the firmware queries
+each one on the general address `0xF8`, which a v3.0 unit answers whatever
+address it is set to. The log shows each unit's real address:
+`[PZEM] CH2 OK (unit addr 0x01): ...`.
+
+Only if units are ever wired onto one **shared** bus would they need distinct
+addresses. In that case use `pzem_set_address(channel, oldAddr, newAddr)`
+from `src/pzem.h`, one unit at a time, and set `PZEMn_ADDR` in `config.h` to
+match.
+
+If a channel still logs `received 0/25 bytes`, it is wiring, not
+addressing. Check 5 V and GND on that PZEM's TTL header, and that the PZEM's
+TX goes to the ESP32 RX pin in the table above.
 
 ## 7. Using cert_uploader (optional)
 

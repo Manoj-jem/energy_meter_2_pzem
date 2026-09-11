@@ -8,8 +8,18 @@
 
 // ── Device identity ──────────────────────────────────────────────
 // One name everywhere: AWS IoT thing, MQTT client ID, topic prefix and the
-// backend's device_id are all "energy-meter-002". Both macros stay string
+// backend's device_id are all the same string. Both macros stay string
 // literals (tools/iot_selftest.py reads them straight out of this file).
+//
+// The value below is the default (energy-meter-002). Other meters are built
+// from their own PlatformIO environment, which overrides AWS_THING_NAME with
+// a -D flag -- see platformio.ini:
+//     pio run -e energy-meter-002 -t upload
+//     pio run -e energy-meter-3   -t upload
+// energy-meter-3 is a second AWS thing with the SAME certificate as
+// energy-meter-002 (attached non-exclusively). That is safe only because the
+// client IDs differ: two connections with one client ID knock each other off
+// the broker in a loop.
 //
 //   AWS_THING_NAME / MQTT_CLIENT_ID: the IoT policy scopes this device's own
 //   topics (/cmd) with ${iot:Connection.Thing.ThingName}, which AWS fills in
@@ -22,8 +32,15 @@
 //   use "energy_meter_002": that is a different row, registered as an MFM384
 //   meter, and the MFM384 decoder turns a PZEM frame into all-null readings
 //   without any error.
+//
+//   energy-meter-3 needs its own "energy-meter-3" row (payload_profile
+//   energywise_pzem_v1). Without one the backend quarantines its frames to
+//   S3 unmapped/. The existing "energy_meter_003" row is another MFM384
+//   placeholder, not this meter.
+#ifndef AWS_THING_NAME
 #define AWS_THING_NAME      "energy-meter-002"
-#define DEVICE_ID           "energy-meter-002"
+#endif
+#define DEVICE_ID           AWS_THING_NAME
 #define FIRMWARE_VERSION    "1.0.0"
 
 #define PZEM_BAUD           9600

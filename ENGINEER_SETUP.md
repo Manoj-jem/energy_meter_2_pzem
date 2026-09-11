@@ -166,6 +166,23 @@ pio run -t upload       # flash
 
 Or use the VS Code status bar: **✓** to build, **➜** to upload.
 
+**Which meter?** Plain `pio run -t upload` builds **energy-meter-002**. For the
+third meter, pick its environment explicitly:
+
+```bash
+pio run -e energy-meter-3 -t upload
+```
+
+(In VS Code, choose the environment in the status bar first.) Both meters use
+the same certificate files in `certs/energy-meter-002/`, and differ only in
+thing name, client ID and topic (`energy-meter-3/data`). Double-check the
+environment before flashing: two meters with the same client ID knock each
+other off AWS in an endless reconnect loop. The boot log line
+`[MQTT] Identity: client_id=...` shows which one you flashed.
+
+To check meter 3's credentials first:
+`python tools/iot_selftest.py --thing energy-meter-3 --publish energy-meter-3/selftest`
+
 The first build downloads the ESP32 toolchain and takes several minutes;
 later builds take about 30 seconds.
 

@@ -103,6 +103,17 @@ auto-reset.
 
 To pick a port explicitly: `pio run -t upload --upload-port COM5`.
 
+One PlatformIO environment per meter; the default is energy-meter-002.
+
+| Meter | Command | Topic |
+|---|---|---|
+| energy-meter-002 | `pio run -t upload` | `energy-meter-002/data` |
+| energy-meter-3 | `pio run -e energy-meter-3 -t upload` | `energy-meter-3/data` |
+
+Both use the certificate in `certs/energy-meter-002/`, attached to both AWS
+things. Never flash the same environment onto two meters: a shared client ID
+makes AWS disconnect them alternately forever.
+
 **There is no separate certificate-upload step.** The firmware carries the PEMs
 and writes them into the modem itself on the first connect attempt.
 

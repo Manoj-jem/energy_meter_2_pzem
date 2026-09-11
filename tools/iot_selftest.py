@@ -14,6 +14,7 @@ config.h so this can never drift from what the device actually does.
 
   python tools/iot_selftest.py
   python tools/iot_selftest.py --publish energy-meter-002/selftest
+  python tools/iot_selftest.py --thing energy-meter-3 --publish energy-meter-3/selftest
   python tools/iot_selftest.py --client-id some-other-id
 """
 import argparse
@@ -134,6 +135,9 @@ def main():
     cfg = config_defines(CONFIG_H)
     ap = argparse.ArgumentParser()
     ap.add_argument("--endpoint", default=cfg.get("MQTT_BROKER_HOST"))
+    ap.add_argument("--thing", default=None,
+                    help="act as this AWS thing, e.g. energy-meter-3 (sets the "
+                         "client ID; the PlatformIO env of the same name builds it)")
     ap.add_argument("--client-id", default=cfg.get("AWS_THING_NAME"))
     ap.add_argument("--device", default="energy-meter-002",
                     help="subdirectory under certs/")
@@ -143,6 +147,8 @@ def main():
                          "to MQTT_TOPIC_SUB after connecting")
     ap.add_argument("--timeout", type=float, default=20.0)
     args = ap.parse_args()
+    if args.thing:
+        args.client_id = args.thing
 
     certs = os.path.join(REPO, "certs", args.device)
     # Same rule as gen_certs.py: the custom-domain server CA written by
@@ -228,7 +234,7 @@ def main():
 
     if args.publish:
         payload = json.dumps({
-            "device_id": cfg.get("DEVICE_ID", "energy-meter-002"),
+            "device_id": args.client_id,   # firmware: DEVICE_ID == AWS_THING_NAME
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "test": True,
             "note": "iot_selftest.py - synthetic frame, not a real reading",

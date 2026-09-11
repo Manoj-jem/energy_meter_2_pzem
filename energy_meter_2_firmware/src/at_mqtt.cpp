@@ -542,7 +542,22 @@ bool at_mqtt_connect() {
     // serves the same chain as meter 001's (openssl s_client, 2026-09-11).
     // AWS does not reject a negotiating ClientHello.
     if (!_at_cmd("AT+CSSLCFG=\"sslversion\",0,4",   AT_DEFAULT_TIMEOUT_MS)) return false;
-    if (!_at_cmd("AT+CSSLCFG=\"authmode\",0,2",     AT_DEFAULT_TIMEOUT_MS)) return false;
+    // ****************************************************************
+    // TEMPORARY DIAGNOSTIC -- authmode forced to 1 (server-auth only, no
+    // client certificate presented). This is NOT a fix and MUST be reverted
+    // to 2 afterwards: AWS IoT still will not accept the MQTT session without
+    // our client cert, so this is expected to fail regardless. The question
+    // it answers is WHERE it fails:
+    //   - err 32 again  -> the base TLS engine cannot complete even an
+    //     unauthenticated handshake with AWS; the client certificate/key are
+    //     not the issue at all.
+    //   - anything else (a different err code, or TLS succeeds and the
+    //     MQTT CONNECT itself is what fails) -> the base engine is fine, and
+    //     the fault is specifically in presenting our client certificate /
+    //     private key (authmode 2's extra step). That would point at a
+    //     corrupted key on the modem or an authmode=2-specific firmware bug.
+    // ****************************************************************
+    if (!_at_cmd("AT+CSSLCFG=\"authmode\",0,1",     AT_DEFAULT_TIMEOUT_MS)) return false;
     if (!_at_cmd("AT+CSSLCFG=\"enableSNI\",0,1",    AT_DEFAULT_TIMEOUT_MS)) return false;
     // Without NITZ the modem RTC can sit in the past, which fails the server
     // cert's validity window and also presents as err 32. "ignorelocaltime" is

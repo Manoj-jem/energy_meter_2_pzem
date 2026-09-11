@@ -658,6 +658,11 @@ static void _run_tls_diagnostics() {
     const bool resolved = _modem_resolve(MQTT_BROKER_HOST, ip, sizeof(ip));
     DBGF("[DIAG] DNS: %s -> %s\n", MQTT_BROKER_HOST, resolved ? ip : "LOOKUP FAILED");
 
+    // Which TLS options this firmware revision supports, and SSL context 0's
+    // current settings -- in case it offers a record-size / buffer option.
+    _at_cmd("AT+CSSLCFG=?", AT_DEFAULT_TIMEOUT_MS);
+    _at_cmd("AT+CSSLCFG?",  AT_DEFAULT_TIMEOUT_MS);
+
     // G first, so the answer is near the top of the log: the full production
     // connect (verify AWS + client cert) with SNI switched OFF. AWS requires
     // an exact host_name in SNI on endpoints with a configured TLS policy
@@ -677,6 +682,14 @@ static void _run_tls_diagnostics() {
     const int b = _diag_attempt("B: AWS, no certificates at all",               aws, 1, 0);
     const int c = _diag_attempt("C: test.mosquitto.org, plain TCP (no TLS)",    "tcp://test.mosquitto.org:1883", 0, 0);
     const int d = _diag_attempt("D: test.mosquitto.org, TLS, nothing checked",  "tcp://test.mosquitto.org:8883", 1, 0);
+    // Server certificate chain size is the suspected limit. Certificate
+    // message sizes (openssl, 2026-09-11): D 933 B works; tls.peet.ws 4060 B
+    // and AWS 4996 B fail. Port 8886 (Let's Encrypt, 3 certs) is 4094 B.
+    const int h = _diag_attempt("H: test.mosquitto.org:8886, ~4.1 KB chain",    "tcp://test.mosquitto.org:8886", 1, 0);
+    // Two more rungs on the size ladder. flespi needs a token for MQTT, so a
+    // non-32 refusal there still means TLS itself completed.
+    const int i = _diag_attempt("I: broker.hivemq.com, ~3.85 KB chain",         "tcp://broker.hivemq.com:8883", 1, 0);
+    const int j = _diag_attempt("J: mqtt.flespi.io, ~4.43 KB chain",            "tcp://mqtt.flespi.io:8883", 1, 0);
     const int e = _diag_attempt("E: meter 001's AWS endpoint, no certificates", OTHER_AWS, 1, 0);
 
     int f = -2;   // -2 = not run (no IP to try)
@@ -718,12 +731,21 @@ static void _run_tls_diagnostics() {
         DBGLN("[DIAG] AWS got past TLS without certificates (B) but not with the client");
         DBGLN("[DIAG] certificate (A): the cert/key FILES on the modem are the problem.");
     } else {
-        DBGLN("[DIAG] Every AWS endpoint rejects this modem's TLS hello within ~150 ms (A,B,E,F),");
-        DBGLN("[DIAG] while another TLS server accepts it (D). AWS and this modem firmware");
-        DBGLN("[DIAG] (see ATI) are incompatible; meter 001 must run different modem firmware.");
+        // err 32 = TLS failed; any other code (0, or an MQTT-level refusal)
+        // means the TLS handshake itself completed.
+        auto tls = [](int r) { return (r == 32 || r == -1) ? "TLS FAIL" : "TLS OK"; };
+        DBGLN("[DIAG] Server certificate chain size vs TLS result on this modem:");
+        DBGF ("[DIAG]   0.93 KB  test.mosquitto.org:8883  %s\n", tls(d));
+        DBGF ("[DIAG]   3.85 KB  broker.hivemq.com        %s\n", tls(i));
+        DBGF ("[DIAG]   4.09 KB  test.mosquitto.org:8886  %s\n", tls(h));
+        DBGF ("[DIAG]   4.43 KB  mqtt.flespi.io           %s\n", tls(j));
+        DBGF ("[DIAG]   5.00 KB  AWS IoT (both accounts)  %s\n", tls(b));
+        DBGLN("[DIAG] If OK turns into FAIL as the size grows, this modem firmware cannot");
+        DBGLN("[DIAG] receive a server certificate chain above that size -- AWS's is 5 KB.");
+        DBGLN("[DIAG] Not certificates, clock, IoT policy, account or network.");
     }
-    DBGF("[DIAG] codes: G=%d A=%d B=%d C=%d D=%d E=%d F=%d  (0 = connected, -2 = not run)\n",
-         g, a, b, c, d, e, f);
+    DBGF("[DIAG] codes: G=%d A=%d B=%d C=%d D=%d I=%d H=%d J=%d E=%d F=%d  (0 = connected, -2 = not run)\n",
+         g, a, b, c, d, i, h, j, e, f);
     DBGLN("[DIAG] ==========================================================================");
 }
 

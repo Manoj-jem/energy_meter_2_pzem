@@ -251,7 +251,9 @@ bool at_mqtt_provision_certs() {
     }
 
     const bool allPresent = haveCa && haveCert && haveKey;
-    const bool fpMatches  = (strcmp(storedFp, CLIENT_CERT_SHA256) == 0);
+    // Bundle hash (CA + cert + key), so replacing the CA alone -- e.g. moving
+    // to the custom-domain server CA -- also re-provisions the modem.
+    const bool fpMatches  = (strcmp(storedFp, CERT_BUNDLE_SHA256) == 0);
 
     if (allPresent && fpMatches) {
         DBGF("[CERT] Store OK — %s serial=%s\n", CERT_DEVICE_NAME, CLIENT_CERT_SERIAL);
@@ -268,7 +270,7 @@ bool at_mqtt_provision_certs() {
     } else {
         DBGF("[CERT]   reason: stale certificate on modem\n");
         DBGF("[CERT]     modem has : %s\n", storedFp[0] ? storedFp : "(never provisioned by this firmware)");
-        DBGF("[CERT]     build has : %s\n", CLIENT_CERT_SHA256);
+        DBGF("[CERT]     build has : %s (CA %s)\n", CERT_BUNDLE_SHA256, CERT_CA_SOURCE);
     }
     DBGF("[CERT]   uploading %s serial=%s valid %s -> %s\n",
          CERT_DEVICE_NAME, CLIENT_CERT_SERIAL,
@@ -289,7 +291,7 @@ bool at_mqtt_provision_certs() {
     }
 
     if (prefs.begin(NVS_NAMESPACE, false)) {         // read-write
-        prefs.putString(NVS_KEY_FP, CLIENT_CERT_SHA256);
+        prefs.putString(NVS_KEY_FP, CERT_BUNDLE_SHA256);
         prefs.end();
     } else {
         // Not fatal: the certs are on the modem and this connect will work.

@@ -63,8 +63,14 @@ CERT_ROOT = os.path.join(PZEM_DIR, "certs")
 OUT_HEADER = os.path.join(FIRMWARE_DIR, "include", "certs_generated.h")
 
 CA_FILE = "AmazonRootCA1.pem"
+# Written by tools/make_iot_server_cert.sh for the AWS IoT *custom domain*.
+# When present it replaces Amazon Root CA 1: the custom domain presents our
+# own short server certificate chain, because the A7670C modem cannot receive
+# AWS's default 4,996-byte chain (see CERTIFICATES.md).
+SERVER_CA_FILE = "server_ca.pem"
 CERT_FILE = "device.cert.pem"
 KEY_FILE = "device.private.key"
+CONFIG_H = os.path.join(FIRMWARE_DIR, "include", "config.h")
 
 
 class CertError(Exception):
@@ -254,6 +260,11 @@ HEADER_TEMPLATE = '''#pragma once
 // content, so this fingerprint is the only way to tell that a modem is
 // holding a *stale* certificate under the right filename.
 #define CLIENT_CERT_SHA256      "{fingerprint}"
+// SHA-256 over all three files exactly as uploaded (CA, cert, key). This is
+// what the firmware records in NVS, so replacing ANY of them -- e.g. moving
+// to the custom-domain server CA -- re-provisions the modem.
+#define CERT_BUNDLE_SHA256      "{bundle}"
+#define CERT_CA_SOURCE          "{ca_file}"
 #define CLIENT_CERT_SERIAL      "{serial}"
 #define CLIENT_CERT_NOT_BEFORE  "{not_before}"
 #define CLIENT_CERT_NOT_AFTER   "{not_after}"
@@ -289,16 +300,20 @@ def generate(device):
             "certificate directory not found: %s\n"
             "       Expected the three AWS IoT files for device %r there." % (cert_dir, device))
 
-    ca_text = read_text(os.path.join(cert_dir, CA_FILE))
+    custom_ca = os.path.isfile(os.path.join(cert_dir, SERVER_CA_FILE))
+    ca_file = SERVER_CA_FILE if custom_ca else CA_FILE
+    check_endpoint_matches_ca(custom_ca)
+
+    ca_text = read_text(os.path.join(cert_dir, ca_file))
     cert_text = read_text(os.path.join(cert_dir, CERT_FILE))
     key_text = read_text(os.path.join(cert_dir, KEY_FILE))
 
-    ca_der, ca_label = pem_to_der(ca_text, CA_FILE)
+    ca_der, ca_label = pem_to_der(ca_text, ca_file)
     cert_der, cert_label = pem_to_der(cert_text, CERT_FILE)
     key_der, key_label = pem_to_der(key_text, KEY_FILE)
 
     if "CERTIFICATE" not in ca_label:
-        raise CertError("%s is %r, expected a CERTIFICATE" % (CA_FILE, ca_label))
+        raise CertError("%s is %r, expected a CERTIFICATE" % (ca_file, ca_label))
     if "CERTIFICATE" not in cert_label:
         raise CertError("%s is %r, expected a CERTIFICATE" % (CERT_FILE, cert_label))
 
@@ -317,11 +332,14 @@ def generate(device):
                modulus_hint(info["modulus"]), modulus_hint(key_modulus)))
 
     fingerprint = hashlib.sha256(cert_der).hexdigest()
+    bundle = hashlib.sha256("\0".join(
+        normalise(t) for t in (ca_text, cert_text, key_text)).encode("utf-8")).hexdigest()
 
     header = HEADER_TEMPLATE.format(
         device=device,
-        ca_file=CA_FILE, cert_file=CERT_FILE, key_file=KEY_FILE,
+        ca_file=ca_file, cert_file=CERT_FILE, key_file=KEY_FILE,
         fingerprint=fingerprint,
+        bundle=bundle,
         serial=info["serial"],
         not_before=info["not_before"],
         not_after=info["not_after"],
@@ -350,7 +368,45 @@ def generate(device):
     print("[gen_certs]   valid       : %s -> %s" % (info["not_before"], info["not_after"]))
     print("[gen_certs]   sha256      : %s" % fingerprint)
     print("[gen_certs]   key/cert    : modulus match OK")
+    print("[gen_certs]   server CA   : %s%s" % (
+        ca_file, "  (custom domain)" if custom_ca else "  (AWS default endpoint)"))
     return fingerprint
+
+
+def normalise(text):
+    """The exact bytes c_string_literal() emits, i.e. what reaches the modem."""
+    body = text.replace("\r\n", "\n").replace("\r", "\n")
+    return body if body.endswith("\n") else body + "\n"
+
+
+def check_endpoint_matches_ca(custom_ca):
+    """Fail the build when the trusted CA cannot possibly verify the endpoint.
+
+    AWS's default endpoint (*-ats.iot.<region>.amazonaws.com) chains to Amazon
+    Root CA 1; the custom domain presents a certificate from our own CA. Mixing
+    them builds fine and then fails every connection with the same opaque
+    +CMQTTCONNECT err=32 this project spent a week diagnosing.
+    """
+    import re
+    with open(CONFIG_H, "r", encoding="utf-8") as handle:
+        m = re.search(r'#define\s+MQTT_BROKER_HOST\s+"([^"]+)"', handle.read())
+    if not m:
+        return
+    host = m.group(1)
+    aws_default = host.endswith(".amazonaws.com")
+    if custom_ca and aws_default:
+        raise CertError(
+            "%s is present, so the modem will trust only our own server CA,\n"
+            "       but MQTT_BROKER_HOST is AWS's default endpoint (%s), whose\n"
+            "       certificate comes from Amazon. Set MQTT_BROKER_HOST in config.h to\n"
+            "       the custom domain, or remove %s to go back to Amazon Root CA 1."
+            % (SERVER_CA_FILE, host, SERVER_CA_FILE))
+    if not custom_ca and not aws_default:
+        raise CertError(
+            "MQTT_BROKER_HOST is %s (a custom domain), but certs/<device>/%s is\n"
+            "       missing, so the modem would trust Amazon Root CA 1 and reject the\n"
+            "       custom domain's certificate. Run tools/make_iot_server_cert.sh."
+            % (host, SERVER_CA_FILE))
 
 
 def modulus_hint(modulus):

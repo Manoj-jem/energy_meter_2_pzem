@@ -19,6 +19,43 @@ subscribes to `+/data`, takes device_id from the topic prefix and picks the
 decoder from `public.device.payload_profile`. `energy_meter_001` stays on
 account 571751567031 and is ingested separately.
 
+### Meters connect through `iot.energywise.tech`, not the default endpoint
+
+The SIMCom A7670C in meter 002 (firmware `V11.0.01`, confirmed on two
+modules) **cannot receive AWS IoT's default server certificate**. AWS sends 4
+certificates, 4,996 bytes in one TLS record, and the modem fails every
+handshake with `+CMQTTCONNECT: 0,32`. It handles chains up to at least
+4.4 KB. On-device diagnosis ruled out certificates, clock, policy, account,
+network, SNI, TLS version, ciphers and certificate requests. The details are
+in `_run_tls_diagnostics()` in `src/at_mqtt.cpp`.
+
+The fix is an AWS IoT **custom domain**: `iot.energywise.tech` (domain
+configuration `energywise-short-chain`, account 481665103941). It presents
+**our own** server certificate, a single certificate of about 0.9 KB. Device
+client certificates, IoT policies and topics are unchanged, and it is the
+same broker, so the backend sees no difference.
+
+| piece | where |
+|---|---|
+| DNS (GoDaddy) | `iot.energywise.tech` CNAME to `a3nyhs5ft5gkz6-ats.iot.ap-south-1.amazonaws.com`, plus an ACM validation CNAME |
+| server cert + key | ACM, ap-south-1 (imported). Copies are in the CA folder below |
+| CA the devices trust | `certs/<device>/server_ca.pem` (public, commit it) |
+| CA **private key** | `~/.energy-meter-iot-ca/ca.key` on the machine that ran the setup. **Never commit it; back it up privately.** Anyone holding it can impersonate the broker to every meter |
+
+The build enforces the pairing. `gen_certs.py` uses `server_ca.pem` whenever
+it exists, and refuses to build if `MQTT_BROKER_HOST` is an `*.amazonaws.com`
+host while `server_ca.pem` is present, or the reverse. Either mismatch would
+otherwise compile fine and fail as err 32.
+
+**Renewing** (the server certificate is valid for 5 years, the CA for 25):
+re-run `tools/make_iot_server_cert.sh iot.energywise.tech`, which reuses the
+CA, then re-import into the same ACM ARN (the script prints the command). No
+firmware change is needed, because devices trust the CA, not the leaf.
+
+**Setting it up again or for another account:**
+`tools/setup_iot_custom_domain.sh <fqdn> certs|domain|verify`. It refuses to
+run against any account other than 481665103941.
+
 ### Verified AWS-side state (2026-09-11)
 
 | item | value |

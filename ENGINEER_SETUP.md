@@ -74,13 +74,18 @@ Copy the file from Step 0 to:
 energy_meter_2_pzem/certs/energy-meter-002/device.private.key
 ```
 
-That directory should now hold exactly three files:
+That directory should now hold these files:
 
 ```
-AmazonRootCA1.pem      1187 bytes
+server_ca.pem          1216 bytes   the CA the modem trusts (iot.energywise.tech)
+AmazonRootCA1.pem      1187 bytes   kept for reference; not used while server_ca.pem exists
 device.cert.pem        1220 bytes
 device.private.key     1679 bytes
 ```
+
+The meter connects to `iot.energywise.tech`, not AWS's default endpoint,
+because its modem cannot receive AWS's default certificate chain. See
+CERTIFICATES.md.
 
 Nothing else needs configuring — no endpoint to edit, no certificate to paste.
 The build reads these three files and generates
@@ -196,8 +201,8 @@ pio device monitor -b 115200
 [CERT] *** RE-PROVISIONING MODEM CERT STORE ***
 [CERT]   reason: files missing — ...
 [CERT]   uploading energy-meter-002 serial=46E4A726... valid 2026-09-10 -> 2049-12-31
-[CERT] AmazonRootCA1.pem: writing 1188 bytes...
-[CERT] AmazonRootCA1.pem: stored
+[CERT] em002_ca.pem: writing 1216 bytes...
+[CERT] em002_ca.pem: stored
 [CERT] em002_cert.pem: writing 1220 bytes...
 [CERT] em002_cert.pem: stored
 [CERT] em002_key.pem: writing 1679 bytes...

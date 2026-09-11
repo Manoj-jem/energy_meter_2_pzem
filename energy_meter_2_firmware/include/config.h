@@ -70,7 +70,16 @@
 // The ingest backend for this account is energy_meter_iot_avaronn
 // (AWS_IOT_ENDPOINT=a3nyhs5ft5gkz6-ats). energy_meter_001 stays on the other
 // account and is ingested separately. See ../CERTIFICATES.md.
-#define MQTT_BROKER_HOST    "a3nyhs5ft5gkz6-ats.iot.ap-south-1.amazonaws.com"
+//
+// NOT the default a3nyhs5ft5gkz6-ats endpoint: the A7670C (fw V11.0.01)
+// cannot receive AWS's default 4,996-byte server certificate chain and fails
+// every handshake with err 32. iot.energywise.tech is an AWS IoT domain
+// configuration in the same account that presents our own ~0.9 KB server
+// certificate (CA: certs/<device>/server_ca.pem, made by
+// tools/make_iot_server_cert.sh). DNS: CNAME iot.energywise.tech ->
+// a3nyhs5ft5gkz6-ats.iot.ap-south-1.amazonaws.com. The modem must send SNI
+// (enableSNI 1): AWS picks the domain configuration by server name.
+#define MQTT_BROKER_HOST    "iot.energywise.tech"
 #define MQTT_BROKER_PORT    8883
 #define MQTT_USERNAME       ""
 #define MQTT_PASSWORD       ""
@@ -85,7 +94,9 @@
 #define MQTT_QOS            1
 #define MQTT_KEEPALIVE_S    60
 
-#define CERT_FILENAME_CA    "AmazonRootCA1.pem"
+// Modem-side name for whichever server CA the build trusts (Amazon Root CA 1,
+// or the custom-domain CA -- see CERT_CA_SOURCE in certs_generated.h).
+#define CERT_FILENAME_CA    "em002_ca.pem"
 #define CERT_FILENAME_CERT  "em002_cert.pem"
 #define CERT_FILENAME_KEY   "em002_key.pem"
 

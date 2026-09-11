@@ -145,7 +145,11 @@ def main():
     args = ap.parse_args()
 
     certs = os.path.join(REPO, "certs", args.device)
-    ca = os.path.join(certs, "AmazonRootCA1.pem")
+    # Same rule as gen_certs.py: the custom-domain server CA written by
+    # tools/make_iot_server_cert.sh replaces Amazon Root CA 1 when present.
+    ca = os.path.join(certs, "server_ca.pem")
+    if not os.path.isfile(ca):
+        ca = os.path.join(certs, "AmazonRootCA1.pem")
     crt = os.path.join(certs, "device.cert.pem")
     key = os.path.join(certs, "device.private.key")
     for path in (ca, crt, key):

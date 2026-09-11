@@ -565,15 +565,62 @@ static int _diag_attempt(const char* label, const char* url, int serverType, int
     return err;
 }
 
+// AT+CDNSGIP="<host>" -> OK, then +CDNSGIP: 1,"<host>","<ip>"[,"<ip2>"]
+// or +CDNSGIP: 0,<err>. Copies the last IP returned into ip.
+static bool _modem_resolve(const char* host, char* ip, size_t ipLen) {
+    char cmd[160];
+    snprintf(cmd, sizeof(cmd), "AT+CDNSGIP=\"%s\"", host);
+    while (gsm.available()) gsm.read();
+    DBG("[AT] >> "); DBGLN(cmd);
+    gsm.print(cmd); gsm.print("\r\n");
+
+    char line[256];
+    uint32_t deadline = millis() + 15000;
+    while (millis() < deadline) {
+        if (!_read_line(line, sizeof(line), 200)) continue;
+        char* p = strstr(line, "+CDNSGIP:");
+        if (p) {
+            if (atoi(p + 9) != 1) return false;          // 0,<err> = lookup failed
+            char* end = strrchr(line, '"');
+            if (!end) return false;
+            *end = '\0';
+            char* start = strrchr(line, '"');
+            if (!start) return false;
+            strncpy(ip, start + 1, ipLen - 1);
+            ip[ipLen - 1] = '\0';
+            return true;
+        }
+        if (strstr(line, "ERROR")) return false;       // OK precedes the URC; keep waiting
+    }
+    return false;
+}
+
 static void _run_tls_diagnostics() {
+    // meter 001's endpoint (AWS account 571751567031), where a device IS
+    // connecting in production. Used only as a comparison target.
+    static const char* OTHER_AWS = "tcp://a1d3i8d08oi632-ats.iot.ap-south-1.amazonaws.com:8883";
+
     char aws[160];
     snprintf(aws, sizeof(aws), "tcp://%s:%d", MQTT_BROKER_HOST, MQTT_BROKER_PORT);
 
     DBGLN("[DIAG] ===== one-time TLS diagnosis (once per boot, nothing is published) =====");
+
+    char ip[64] = {0};
+    const bool resolved = _modem_resolve(MQTT_BROKER_HOST, ip, sizeof(ip));
+    DBGF("[DIAG] DNS: %s -> %s\n", MQTT_BROKER_HOST, resolved ? ip : "LOOKUP FAILED");
+
     const int a = _diag_attempt("A: AWS, client cert, AWS cert NOT checked",   aws, 1, 3);
     const int b = _diag_attempt("B: AWS, no certificates at all",               aws, 1, 0);
     const int c = _diag_attempt("C: test.mosquitto.org, plain TCP (no TLS)",    "tcp://test.mosquitto.org:1883", 0, 0);
     const int d = _diag_attempt("D: test.mosquitto.org, TLS, nothing checked",  "tcp://test.mosquitto.org:8883", 1, 0);
+    const int e = _diag_attempt("E: meter 001's AWS endpoint, no certificates", OTHER_AWS, 1, 0);
+
+    int f = -2;   // -2 = not run (no IP to try)
+    if (resolved && strchr(ip, '.')) {
+        char byIp[96];
+        snprintf(byIp, sizeof(byIp), "tcp://%s:%d", ip, MQTT_BROKER_PORT);
+        f = _diag_attempt("F: AWS by IP address (no DNS), no certs", byIp, 1, 0);
+    }
 
     // Leave the modem as the production connect expects it.
     _mqtt_teardown();
@@ -583,22 +630,32 @@ static void _run_tls_diagnostics() {
     if (a == 0) {
         DBGLN("[DIAG] A CONNECTED. AWS accepts this device's certificate and the link works.");
         DBGLN("[DIAG] The only failing step is the MODEM CHECKING AWS'S CERTIFICATE against");
-        DBGLN("[DIAG] the CA file on the modem. Not the clock (it is OK above), not the device cert.");
+        DBGLN("[DIAG] the CA file on the modem. Not the clock, not the device cert.");
     } else if (c != 0) {
         DBGLN("[DIAG] C failed: even plain MQTT over TCP does not work. This is the data path");
         DBGLN("[DIAG] (SIM data plan, APN, or the operator blocking the port), not TLS or certs.");
     } else if (d != 0) {
         DBGLN("[DIAG] C worked, D failed: the network is fine but this modem cannot complete");
         DBGLN("[DIAG] TLS with any server. Modem TLS/firmware problem, not certs, not AWS.");
+    } else if (!resolved) {
+        DBGLN("[DIAG] The modem cannot resolve the AWS endpoint name (DNS). TLS itself works (D).");
+        DBGLN("[DIAG] Check the SIM operator's DNS, or configure public DNS on the modem.");
+    } else if (f == 0) {
+        DBGLN("[DIAG] AWS works BY IP (F) but not BY NAME (B): the modem's handling of the AWS");
+        DBGLN("[DIAG] hostname is the problem (DNS answer or hostname length), not TLS or certs.");
+    } else if (e == 0) {
+        DBGLN("[DIAG] Meter 001's AWS endpoint works (E) but this one does not (B): something");
+        DBGLN("[DIAG] specific to account 481665103941's endpoint. Send this log.");
     } else if (b != 32) {
-        DBGLN("[DIAG] TLS works (D), and AWS got past TLS without certificates (B), but not");
-        DBGLN("[DIAG] with the client certificate (A). The cert/key FILES on the modem are the");
-        DBGLN("[DIAG] problem; re-upload them (cert_uploader) or re-issue the certificate.");
+        DBGLN("[DIAG] AWS got past TLS without certificates (B) but not with the client");
+        DBGLN("[DIAG] certificate (A): the cert/key FILES on the modem are the problem.");
     } else {
-        DBGLN("[DIAG] TLS works with another server (D) but never with AWS, even unverified (A).");
-        DBGLN("[DIAG] AWS-specific handshake incompatibility in this modem's firmware.");
+        DBGLN("[DIAG] Every AWS endpoint rejects this modem's TLS hello within ~150 ms (A,B,E,F),");
+        DBGLN("[DIAG] while another TLS server accepts it (D). AWS and this modem firmware");
+        DBGLN("[DIAG] (see ATI) are incompatible; meter 001 must run different modem firmware.");
     }
-    DBGF("[DIAG] codes: A=%d B=%d C=%d D=%d  (0 = connected)\n", a, b, c, d);
+    DBGF("[DIAG] codes: A=%d B=%d C=%d D=%d E=%d F=%d  (0 = connected, -2 = not run)\n",
+         a, b, c, d, e, f);
     DBGLN("[DIAG] ==========================================================================");
 }
 

@@ -311,6 +311,71 @@ static void _mqtt_teardown() {
     DBGLN("[MQTT] Teardown done");
 }
 
+// ── Modem clock ─────────────────────────────────────────────────────
+//
+// The modem checks AWS's server certificate against its own RTC. The A7670C
+// (seen on revision V11.0.01) boots at 1970-01-01 and, unless the operator
+// sends network time, stays there. Every certificate then looks "not yet
+// valid" and CMQTTCONNECT fails with err 32. AT+CSSLCFG="ignorelocaltime"
+// returns OK on that revision but does not prevent it. So set the clock
+// before every TLS attempt: network time if the operator provides it, NTP
+// otherwise. The same clock stamps every payload (at_mqtt_get_timestamp).
+
+// Two-digit year from AT+CCLK?, or -1.
+static int _modem_year() {
+    while (gsm.available()) gsm.read();
+    DBGLN("[AT] >> AT+CCLK?");
+    gsm.print("AT+CCLK?\r\n");
+
+    char line[128];
+    int  year = -1;
+    uint32_t deadline = millis() + AT_DEFAULT_TIMEOUT_MS;
+    while (millis() < deadline) {
+        if (!_read_line(line, sizeof(line), 200)) continue;
+        const char* p = strstr(line, "+CCLK:");
+        if (p && (p = strchr(p, '"')) != nullptr) year = atoi(p + 1);
+        if (strstr(line, "OK") || strstr(line, "ERROR")) break;
+    }
+    return year;
+}
+
+// CCLK years are two digits, and an unset RTC reads "70" (1970) -- so the
+// check needs an upper bound as well as a lower one.
+static bool _year_valid(int yy) { return yy >= 25 && yy < 70; }
+
+static const char* const NTP_SERVERS[] = {
+    "pool.ntp.org", "time.google.com", "time.cloudflare.com"
+};
+
+static bool _sync_modem_clock() {
+    int yy = _modem_year();
+    if (_year_valid(yy)) return true;
+
+    DBGF("[TIME] Modem clock not set (year %02d) - TLS would reject AWS's certificate\n", yy);
+
+    // Network time (NITZ). A persistent setting that applies on the
+    // operator's next time update, so it usually cannot help this attempt.
+    _at_cmd("AT+CTZU=1", AT_DEFAULT_TIMEOUT_MS);
+
+    char cmd[80];
+    for (const char* server : NTP_SERVERS) {
+        snprintf(cmd, sizeof(cmd), "AT+CNTP=\"%s\",0", server);   // 0 = UTC
+        if (!_at_cmd(cmd, AT_DEFAULT_TIMEOUT_MS)) continue;
+
+        int err = -1;   // +CNTP: 0 = success; 1 unknown, 2 bad param, 3 bad time, 4 network
+        if (_at_cmd_two_stage("AT+CNTP", "+CNTP:", 20000, &err) && err == 0) {
+            yy = _modem_year();
+            if (_year_valid(yy)) {
+                DBGF("[TIME] Modem clock set via NTP (%s)\n", server);
+                return true;
+            }
+        }
+        DBGF("[TIME] NTP via %s failed (err=%d)\n", server, err);
+    }
+    DBGLN("[TIME] Could not set the modem clock - expect CMQTTCONNECT err 32");
+    return false;
+}
+
 bool gsm_modem_init() {
     gsm.begin(GSM_UART_BAUD, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
     delay(100);
@@ -366,6 +431,10 @@ bool at_mqtt_connect() {
         DBGLN("[MQTT] Cert store not usable — aborting connect attempt");
         return false;
     }
+
+    // Non-fatal: the attempt still runs, so a module that does honour
+    // ignorelocaltime keeps working when no time source is reachable.
+    _sync_modem_clock();
 
     DBGF("[MQTT] Identity: client_id=%s thing=%s device_id=%s topic=%s\n",
          MQTT_CLIENT_ID, AWS_THING_NAME, DEVICE_ID, MQTT_TOPIC_PUB);

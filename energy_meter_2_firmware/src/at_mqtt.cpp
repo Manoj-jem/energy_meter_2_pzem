@@ -1,6 +1,7 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
+#include <esp_task_wdt.h>
 #include "config.h"
 #include "at_mqtt.h"
 #include "certs_generated.h"
@@ -512,6 +513,95 @@ bool gsm_modem_init() {
     return true;
 }
 
+// ── One-shot TLS diagnosis ──────────────────────────────────────────
+//
+// CMQTTCONNECT reports a server-certificate check failure, a client-
+// certificate problem, an AWS disconnect and a dead data path all as err 32.
+// On the first err 32 of each boot this runs four connect attempts that each
+// remove one variable, then prints a verdict. Nothing is published; every
+// connection that succeeds is closed immediately. SSL context 0 keeps its
+// cacert/clientcert/clientkey/SNI settings; only authmode is varied, and it
+// is put back to 2 afterwards.
+//
+//   authmode: 0 = no certificates checked or sent
+//             2 = verify AWS + present client cert (production)
+//             3 = present client cert, do NOT verify AWS's certificate
+static bool _tlsDiagDone = false;
+
+static int _diag_attempt(const char* label, const char* url, int serverType, int authmode) {
+    char cmd[200];
+    int  err = -1;
+
+    // Four attempts can take ~2 minutes; networkTask is on the task watchdog
+    // (TASK_WATCHDOG_TIMEOUT_S), so feed it per attempt rather than let a
+    // diagnosis reset the board halfway through.
+    esp_task_wdt_reset();
+
+    _mqtt_teardown();
+    if (serverType == 1) {
+        snprintf(cmd, sizeof(cmd), "AT+CSSLCFG=\"authmode\",0,%d", authmode);
+        _at_cmd(cmd, AT_DEFAULT_TIMEOUT_MS);
+    }
+    int startErr = -1;
+    _at_cmd_two_stage("AT+CMQTTSTART", "+CMQTTSTART:", AT_DEFAULT_TIMEOUT_MS * 2, &startErr);
+    delay(300);
+
+    snprintf(cmd, sizeof(cmd), "AT+CMQTTACCQ=0,\"%s-diag\",%d", MQTT_CLIENT_ID, serverType);
+    if (!_at_cmd(cmd, AT_DEFAULT_TIMEOUT_MS)) {
+        DBGF("[DIAG] %s -> CMQTTACCQ failed, test skipped\n", label);
+        return -1;
+    }
+    if (serverType == 1) _at_cmd("AT+CMQTTSSLCFG=0,0", AT_DEFAULT_TIMEOUT_MS);
+
+    snprintf(cmd, sizeof(cmd), "AT+CMQTTCONNECT=0,\"%s\",60,1", url);
+    const uint32_t t0 = millis();
+    if (!_at_cmd_two_stage(cmd, "+CMQTTCONNECT:", AT_CONNECT_TIMEOUT_MS, &err)) err = -1;
+    // Duration matters: an instant failure means the modem gave up before
+    // talking to the server at all; a second or more means a real exchange.
+    DBGF("[DIAG] %s -> %s  err=%d (%s) after %lu ms\n",
+         label, err == 0 ? "CONNECTED" : "failed", err,
+         err >= 0 ? at_mqtt_err_string(err) : "no reply", (unsigned long)(millis() - t0));
+    if (err == 0) _at_cmd("AT+CMQTTDISC=0,10", 5000);
+    return err;
+}
+
+static void _run_tls_diagnostics() {
+    char aws[160];
+    snprintf(aws, sizeof(aws), "tcp://%s:%d", MQTT_BROKER_HOST, MQTT_BROKER_PORT);
+
+    DBGLN("[DIAG] ===== one-time TLS diagnosis (once per boot, nothing is published) =====");
+    const int a = _diag_attempt("A: AWS, client cert, AWS cert NOT checked",   aws, 1, 3);
+    const int b = _diag_attempt("B: AWS, no certificates at all",               aws, 1, 0);
+    const int c = _diag_attempt("C: test.mosquitto.org, plain TCP (no TLS)",    "tcp://test.mosquitto.org:1883", 0, 0);
+    const int d = _diag_attempt("D: test.mosquitto.org, TLS, nothing checked",  "tcp://test.mosquitto.org:8883", 1, 0);
+
+    // Leave the modem as the production connect expects it.
+    _mqtt_teardown();
+    _at_cmd("AT+CSSLCFG=\"authmode\",0,2", AT_DEFAULT_TIMEOUT_MS);
+
+    DBGLN("[DIAG] ----- verdict -----");
+    if (a == 0) {
+        DBGLN("[DIAG] A CONNECTED. AWS accepts this device's certificate and the link works.");
+        DBGLN("[DIAG] The only failing step is the MODEM CHECKING AWS'S CERTIFICATE against");
+        DBGLN("[DIAG] the CA file on the modem. Not the clock (it is OK above), not the device cert.");
+    } else if (c != 0) {
+        DBGLN("[DIAG] C failed: even plain MQTT over TCP does not work. This is the data path");
+        DBGLN("[DIAG] (SIM data plan, APN, or the operator blocking the port), not TLS or certs.");
+    } else if (d != 0) {
+        DBGLN("[DIAG] C worked, D failed: the network is fine but this modem cannot complete");
+        DBGLN("[DIAG] TLS with any server. Modem TLS/firmware problem, not certs, not AWS.");
+    } else if (b != 32) {
+        DBGLN("[DIAG] TLS works (D), and AWS got past TLS without certificates (B), but not");
+        DBGLN("[DIAG] with the client certificate (A). The cert/key FILES on the modem are the");
+        DBGLN("[DIAG] problem; re-upload them (cert_uploader) or re-issue the certificate.");
+    } else {
+        DBGLN("[DIAG] TLS works with another server (D) but never with AWS, even unverified (A).");
+        DBGLN("[DIAG] AWS-specific handshake incompatibility in this modem's firmware.");
+    }
+    DBGF("[DIAG] codes: A=%d B=%d C=%d D=%d  (0 = connected)\n", a, b, c, d);
+    DBGLN("[DIAG] ==========================================================================");
+}
+
 bool at_mqtt_connect() {
     char cmdBuf[300];
     int  err = -1;
@@ -590,26 +680,21 @@ bool at_mqtt_connect() {
         // several unrelated causes the modem cannot distinguish. Spell them out
         // so the next serial log is self-diagnosing.
         if (err == 32 || err == 33 || err == 34) {
-            // Diagnosed 2026-09-11 on this unit (A7670C-LNNV V11.0.01): err 32
-            // reproduces identically with authmode temporarily forced to 1
-            // (no client certificate presented at all), against an endpoint
-            // independently verified (openssl s_client, tools/iot_selftest.py)
-            // to serve a byte-identical TLS 1.2 handshake to a WORKING meter's
-            // account -- same chain, same ciphers, same TLS 1.1-1.3 support.
-            // So on this unit the certificate/key/policy/clock/account are NOT
-            // the cause; the failure is in this module's base TLS engine
-            // (likely its ECDHE handling or its 4-certificate chain
-            // verification) before a client certificate would ever matter.
-            // Items 1-4 below remain worth checking on a DIFFERENT unit or
-            // after a modem firmware update, but do not re-chase them on
-            // this one without new evidence.
-            DBGLN("[MQTT]   TLS failed before MQTT started. Check, in order:");
-            DBGF ("[MQTT]     1. cert on modem = %s (this build)\n", CLIENT_CERT_SHA256);
-            DBGLN("[MQTT]        compare with the AWS IoT console's certificate fingerprint");
-            DBGLN("[MQTT]     2. that certificate is ACTIVE and attached to a policy AND the thing");
-            DBGF ("[MQTT]     3. modem clock — cert is not valid before %s\n", CLIENT_CERT_NOT_BEFORE);
-            DBGLN("[MQTT]     4. endpoint is the -ats endpoint (chains to Amazon Root CA 1)");
-            _at_cmd("AT+CCLK?", AT_DEFAULT_TIMEOUT_MS);   // modem clock, for item 3
+            // Measurements, not a checklist. An earlier version printed fixed
+            // reminders ("modem clock -- cert is not valid before <date>") on
+            // every failure, which read as if the modem had found a clock
+            // problem when it had not.
+            DBGLN("[MQTT]   TLS handshake did not complete. Measured:");
+            DBGF ("[MQTT]     cert on modem : %s (same as this build)\n", CLIENT_CERT_SHA256);
+            const int yy = _modem_year();
+            DBGF ("[MQTT]     modem clock   : year 20%02d -> %s\n", yy < 0 ? 0 : yy,
+                  _year_valid(yy) ? "OK" : "WRONG - the modem would reject AWS's certificate");
+            DBGLN("[MQTT]     (this device's own cert start date is checked by AWS, not by the modem)");
+
+            if (!_tlsDiagDone) {
+                _tlsDiagDone = true;
+                _run_tls_diagnostics();
+            }
 
             if (++_tlsFailStreak >= TLS_FAILS_BEFORE_REUPLOAD) {
                 DBGF("[CERT] %u TLS failures in a row - discarding the NVS record so "

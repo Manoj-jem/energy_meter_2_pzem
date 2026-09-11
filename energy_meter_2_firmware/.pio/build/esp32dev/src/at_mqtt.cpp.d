@@ -134,4 +134,5 @@
  C:/Users/PC.DESKTOP-Q8L0TS6/.platformio/packages/framework-arduinoespressif32/cores/esp32/io_pin_remap.h \
  C:/Users/PC.DESKTOP-Q8L0TS6/.platformio/packages/framework-arduinoespressif32/cores/esp32/Arduino.h \
  C:/Users/PC.DESKTOP-Q8L0TS6/.platformio/packages/framework-arduinoespressif32/libraries/Preferences/src/Preferences.h \
+ C:/Users/PC.DESKTOP-Q8L0TS6/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_system/include/esp_task_wdt.h \
  include/config.h include/at_mqtt.h include/certs_generated.h

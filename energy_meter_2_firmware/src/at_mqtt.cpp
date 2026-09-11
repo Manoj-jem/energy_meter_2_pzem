@@ -644,6 +644,42 @@ static void _diag_clienthello() {
     _at_cmd("AT+HTTPTERM", 3000);
 }
 
+// HTTPS GET through the modem's HTTP client (same TLS stack as CMQTT) with no
+// client certificate. Returns the HTTP status: any real status (200, 403, ...)
+// means the TLS handshake completed; 715 means the modem's TLS handshake
+// failed; other 7xx are modem-side errors.
+static int _diag_https_status(const char* label, const char* url) {
+    esp_task_wdt_reset();
+    _at_cmd("AT+HTTPTERM", 3000);                     // ERROR if not initialised: fine
+    if (!_at_cmd("AT+HTTPINIT", 5000)) { DBGF("[DIAG] %s -> HTTPINIT failed\n", label); return -1; }
+    _at_cmd("AT+CSSLCFG=\"authmode\",0,0", AT_DEFAULT_TIMEOUT_MS);
+
+    char cmd[200];
+    snprintf(cmd, sizeof(cmd), "AT+HTTPPARA=\"URL\",\"%s\"", url);
+    _at_cmd(cmd, 5000);
+    _at_cmd("AT+HTTPPARA=\"SSLCFG\",0", 5000);
+
+    int method = -1, status = -1, len = -1;
+    while (gsm.available()) gsm.read();
+    DBGLN("[AT] >> AT+HTTPACTION=0");
+    gsm.print("AT+HTTPACTION=0\r\n");
+    const uint32_t t0 = millis();
+    const uint32_t deadline = t0 + 40000;
+    while (millis() < deadline) {
+        if (!_read_line(_diagBuf, sizeof(_diagBuf), 200)) continue;
+        const char* p = strstr(_diagBuf, "+HTTPACTION:");
+        if (p && sscanf(p + 12, " %d,%d,%d", &method, &status, &len) == 3) break;
+        if (strstr(_diagBuf, "ERROR")) break;
+    }
+    DBGF("[DIAG] %s -> HTTP status %d (%s) after %lu ms\n", label, status,
+         status == 715 ? "modem: TLS handshake FAILED"
+         : status >= 700 ? "modem-side error"
+         : status > 0 ? "TLS handshake COMPLETED" : "no reply",
+         (unsigned long)(millis() - t0));
+    _at_cmd("AT+HTTPTERM", 3000);
+    return status;
+}
+
 static void _run_tls_diagnostics() {
     // meter 001's endpoint (AWS account 571751567031), where a device IS
     // connecting in production. Used only as a comparison target.
@@ -677,6 +713,25 @@ static void _run_tls_diagnostics() {
     _mqtt_teardown();
     esp_task_wdt_reset();
     _diag_clienthello();
+
+    // K: the same AWS IoT host and the same 4,996-byte certificate record as
+    // port 8883 -- but on 443, where AWS does NOT send a CertificateRequest.
+    // This separates "cannot receive AWS's 5 KB chain" from "cannot handle
+    // AWS's request for a client certificate" (openssl survey, 2026-09-11).
+    char awsHttps[160];
+    snprintf(awsHttps, sizeof(awsHttps), "https://%s:443/", MQTT_BROKER_HOST);
+    const int k = _diag_https_status("K: AWS IoT :443 (same 5 KB chain, no cert request)", awsHttps);
+
+    // L: the mirror image of K -- a server that DOES send a CertificateRequest
+    // (client certificate optional) with a chain smaller than flespi's
+    // 4,431 B, which this modem already handles. client.badssl.com: 4,074 B.
+    const int l = _diag_https_status("L: client.badssl.com (4.07 KB chain + cert request)",
+                                     "https://client.badssl.com/");
+    // L2: a request shaped like AWS's -- no CA names, RSA-PSS-PSS (and EdDSA)
+    // signature methods listed -- with a 4,073 B chain. badssl's (L) has
+    // CA names and no PSS entries, so L vs L2 isolates the PSS entries.
+    const int l2 = _diag_https_status("L2: certauth.idrix.fr (4.07 KB chain + PSS-style request)",
+                                      "https://certauth.idrix.fr/");
 
     const int a = _diag_attempt("A: AWS, client cert, AWS cert NOT checked",   aws, 1, 3);
     const int b = _diag_attempt("B: AWS, no certificates at all",               aws, 1, 0);
@@ -744,8 +799,34 @@ static void _run_tls_diagnostics() {
         DBGLN("[DIAG] receive a server certificate chain above that size -- AWS's is 5 KB.");
         DBGLN("[DIAG] Not certificates, clock, IoT policy, account or network.");
     }
-    DBGF("[DIAG] codes: G=%d A=%d B=%d C=%d D=%d I=%d H=%d J=%d E=%d F=%d  (0 = connected, -2 = not run)\n",
-         g, a, b, c, d, i, h, j, e, f);
+    // K: AWS's 5 KB chain, no CertificateRequest.  L: 4 KB chain + CertificateRequest.
+    auto httpsOk = [](int s) { return s > 0 && s < 700; };
+    DBGLN("[DIAG] ----- chain size vs certificate request (K, L) -----");
+    DBGF ("[DIAG]   K  AWS IoT :443     5.0 KB chain, no cert request  -> %s\n",
+          httpsOk(k) ? "TLS OK" : (k == 715 ? "TLS FAIL" : "inconclusive"));
+    DBGF ("[DIAG]   L  client.badssl.com 4.1 KB chain + cert request    -> %s\n",
+          httpsOk(l) ? "TLS OK" : (l == 715 ? "TLS FAIL" : "inconclusive"));
+    DBGF ("[DIAG]   L2 certauth.idrix.fr 4.1 KB chain + PSS-style req  -> %s\n",
+          httpsOk(l2) ? "TLS OK" : (l2 == 715 ? "TLS FAIL" : "inconclusive"));
+    if (httpsOk(k) && l == 715) {
+        DBGLN("[DIAG] => The 5 KB chain is fine; ANY certificate request breaks this modem's TLS.");
+    } else if (httpsOk(k) && httpsOk(l)) {
+        DBGLN("[DIAG] => Chain size and certificate requests in general are fine; only AWS's");
+        DBGLN("[DIAG]    particular CertificateRequest (port 8883) breaks this modem's TLS.");
+    } else if (k == 715 && httpsOk(l)) {
+        DBGLN("[DIAG] => Certificate requests are fine; this modem cannot receive AWS's");
+        DBGLN("[DIAG]    4,996-byte certificate record.");
+    } else if (k == 715 && l == 715) {
+        DBGLN("[DIAG] => Both fail: AWS's 5 KB record AND certificate requests break this modem.");
+    } else {
+        DBGLN("[DIAG] => Inconclusive; send this log.");
+    }
+    if (httpsOk(l) && l2 == 715) {
+        DBGLN("[DIAG] => L passed but L2 failed: a certificate request that lists RSA-PSS-PSS /");
+        DBGLN("[DIAG]    EdDSA methods (as AWS's does) breaks this modem; a plain one does not.");
+    }
+    DBGF("[DIAG] codes: G=%d A=%d B=%d C=%d D=%d I=%d H=%d J=%d E=%d F=%d K=%d L=%d L2=%d  (0 = connected, -2 = not run)\n",
+         g, a, b, c, d, i, h, j, e, f, k, l, l2);
     DBGLN("[DIAG] ==========================================================================");
 }
 

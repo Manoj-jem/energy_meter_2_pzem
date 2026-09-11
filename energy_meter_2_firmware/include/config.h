@@ -7,20 +7,23 @@
 // ================================================================
 
 // ── Device identity ──────────────────────────────────────────────
-// Two DIFFERENT names, deliberately. They are not interchangeable:
+// One name everywhere: AWS IoT thing, MQTT client ID, topic prefix and the
+// backend's device_id are all "energy-meter-002". Both macros stay string
+// literals (tools/iot_selftest.py reads them straight out of this file).
 //
-//   AWS_THING_NAME is the AWS IoT *thing*. The IoT policy scopes
-//   iot:Connect to client/${iot:Connection.Thing.ThingName}, so the MQTT
-//   client ID must match it character for character or the broker denies
-//   the CONNECT *after* a successful TLS handshake.
+//   AWS_THING_NAME / MQTT_CLIENT_ID: the IoT policy scopes this device's own
+//   topics (/cmd) with ${iot:Connection.Thing.ThingName}, which AWS fills in
+//   only when the client ID equals the thing attached to the certificate.
 //
-//   DEVICE_ID is the backend's identity for this meter. mqtt_worker.py
+//   DEVICE_ID: the backend (energy_meter_iot_avaronn, mqtt_worker.py)
 //   subscribes to "+/data" and takes device_id from the topic prefix, then
-//   looks it up in the device registry. Changing DEVICE_ID without adding
-//   the matching backend rows (devices, device_profile, device_ct_config)
-//   sends every reading to S3 under unmapped/.
+//   picks the decoder from public.device.payload_profile. The row for this
+//   meter is "energy-meter-002" (payload_profile energywise_pzem_v1). Do NOT
+//   use "energy_meter_002": that is a different row, registered as an MFM384
+//   meter, and the MFM384 decoder turns a PZEM frame into all-null readings
+//   without any error.
 #define AWS_THING_NAME      "energy-meter-002"
-#define DEVICE_ID           "energy_meter_002"
+#define DEVICE_ID           "energy-meter-002"
 #define FIRMWARE_VERSION    "1.0.0"
 
 #define PZEM_BAUD           9600
@@ -64,18 +67,19 @@
 // energy_meter_001 lives. That mismatch, not the certificate files, is why
 // this device never connected.
 //
-// NOTE: energy_meter_backend_iot still subscribes on 571751567031
-// (app/services/mqtt_worker.py, AWS_IOT_ENDPOINT). Until it also points here,
-// meter 002's data will reach AWS but not the backend. See ../CERTIFICATES.md.
+// The ingest backend for this account is energy_meter_iot_avaronn
+// (AWS_IOT_ENDPOINT=a3nyhs5ft5gkz6-ats). energy_meter_001 stays on the other
+// account and is ingested separately. See ../CERTIFICATES.md.
 #define MQTT_BROKER_HOST    "a3nyhs5ft5gkz6-ats.iot.ap-south-1.amazonaws.com"
 #define MQTT_BROKER_PORT    8883
 #define MQTT_USERNAME       ""
 #define MQTT_PASSWORD       ""
 #define MQTT_CLIENT_ID      AWS_THING_NAME
-// Topics stay on DEVICE_ID so the existing backend registration keeps
-// working. If the IoT policy also scopes iot:Publish/iot:Subscribe to
-// topic/${iot:Connection.Thing.ThingName}/... rather than topic/*, these
-// must move to AWS_THING_NAME and the backend must register that id too.
+// meter-energy-002-policy allows publish on */data (the backend's "+/data"
+// subscription receives it) and publish/subscribe/receive on
+// ${iot:Connection.Thing.ThingName}/*, which is where /cmd lives. AWS drops
+// the whole connection on an unauthorised SUBSCRIBE or PUBLISH, so a topic
+// outside those two patterns shows up as a reconnect loop, not an error.
 #define MQTT_TOPIC_PUB      DEVICE_ID "/data"
 #define MQTT_TOPIC_SUB      DEVICE_ID "/cmd"
 #define MQTT_QOS            1

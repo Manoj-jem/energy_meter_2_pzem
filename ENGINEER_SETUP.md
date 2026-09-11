@@ -93,9 +93,12 @@ The build reads these three files and generates
 ```bash
 cd energy_meter_2_pzem
 python tools/iot_selftest.py \
-    --subscribe energy_meter_002/cmd \
-    --publish   energy_meter_002/selftest
+    --subscribe energy-meter-002/cmd \
+    --publish   energy-meter-002/selftest
 ```
+
+(Use `/selftest`, not `/data`. Anything on `/data` goes into the production
+database.)
 
 Expected:
 
@@ -221,9 +224,14 @@ isn't being rewritten every boot.
 
 ## Step 9 — Confirm data is arriving
 
-AWS IoT console (account **481665103941**, region **ap-south-1**) → **MQTT test
-client** → subscribe to `energy_meter_002/data`. Frames should appear every
-~2 seconds (`SEND_INTERVAL_MS`).
+1. **AWS.** IoT console (account **481665103941**, region **ap-south-1**) →
+   **MQTT test client** → subscribe to `energy-meter-002/data`. Frames should
+   appear every ~2 seconds (`SEND_INTERVAL_MS`).
+2. **Backend.** `GET /mqtt/status` on energy_meter_iot_avaronn: `message_count`
+   rises, `unmapped_count` stays 0, and `last_message.device_id` is
+   `energy-meter-002`. After the next 5-minute boundary, `last_seen_at` on the
+   `energy-meter-002` row in `public.device` updates and a `reading_5min_avg`
+   row appears for it.
 
 ---
 
@@ -246,7 +254,7 @@ their configured address, which separates "not wired" from "wrong address".
 git clone https://github.com/Manoj-jem/energy_meter_2_pzem.git
 cd energy_meter_2_pzem
 # copy device.private.key into certs/energy-meter-002/
-python tools/iot_selftest.py --publish energy_meter_002/selftest   # expect PASS
+python tools/iot_selftest.py --publish energy-meter-002/selftest   # expect PASS
 cd energy_meter_2_firmware
 pio run -t upload
 pio device monitor -b 115200

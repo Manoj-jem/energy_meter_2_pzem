@@ -13,7 +13,7 @@ Endpoint, client ID and cert directory are parsed out of the firmware's
 config.h so this can never drift from what the device actually does.
 
   python tools/iot_selftest.py
-  python tools/iot_selftest.py --publish energy_meter_002/selftest
+  python tools/iot_selftest.py --publish energy-meter-002/selftest
   python tools/iot_selftest.py --client-id some-other-id
 """
 import argparse
@@ -224,7 +224,7 @@ def main():
 
     if args.publish:
         payload = json.dumps({
-            "device_id": cfg.get("DEVICE_ID", "energy_meter_002"),
+            "device_id": cfg.get("DEVICE_ID", "energy-meter-002"),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "test": True,
             "note": "iot_selftest.py - synthetic frame, not a real reading",

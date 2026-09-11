@@ -11,24 +11,33 @@ only as `+CMQTTCONNECT: 0,32` — the same code it gives for a missing file, an
 inactive certificate and a clock problem. The endpoint must belong to the
 account that issued the files in `certs/energy-meter-002/`.
 
-> **Open item — the backend is still on the other account.**
-> `energy_meter_001` lives in account **571751567031**
-> (`a1d3i8d08oi632-ats…`), and `energy_meter_backend_iot` subscribes there:
-> `app/services/mqtt_worker.py` (`AWS_IOT_ENDPOINT`) and `docker-compose.yml`.
-> Until the backend also points at `a3nyhs5ft5gkz6-ats` with a subscriber
-> certificate from 481665103941, meter 002's data reaches AWS but never reaches
-> the backend. Either migrate meter 001 to the new account, or run a second
-> subscriber. Changing the backend endpoint alone would break meter 001.
+### Where the data goes
 
-### Verified AWS-side state (2026-09-10)
+The ingest backend for this account is **energy_meter_iot_avaronn**
+(`app/services/mqtt_worker.py`). It connects to `a3nyhs5ft5gkz6-ats`,
+subscribes to `+/data`, takes device_id from the topic prefix and picks the
+decoder from `public.device.payload_profile`. `energy_meter_001` stays on
+account 571751567031 and is ingested separately.
+
+### Verified AWS-side state (2026-09-11)
 
 | item | value |
 |---|---|
-| certificate `5efe96f3…2c2b` | **ACTIVE** |
-| attached thing | `energy-meter-002` |
-| attached policy | `meter-energy-002-policy` |
-| `iot:Connect` | `client/*` (any client ID) |
-| `iot:Publish` / `Subscribe` / `Receive` | `energy_meter_002/*` |
+| certificate `5efe96f3…2c2b` | **ACTIVE**, attached to thing `energy-meter-002` |
+| attached policy | `meter-energy-002-policy`, **version 4** |
+| `iot:Connect` | `client/*` |
+| `iot:Publish` | `*/data`, `${iot:Connection.Thing.ThingName}/*` |
+| `iot:Subscribe` | `+/data`, `${iot:Connection.Thing.ThingName}/*` |
+| `iot:Receive` | `*/data`, `${iot:Connection.Thing.ThingName}/*` |
+
+**`+` is not a wildcard in a policy resource.** Inside a `topic/...` resource
+it is a literal character; only `*` and `?` match. `topicfilter/+/data` is
+correct, because it authorises subscribing to the literal filter `+/data`. But
+`topic/+/data` matches no real topic. Version 3 of this policy used it for
+Publish and Receive, which denied every meter's publish and every delivery to
+the backend. AWS answers an unauthorised PUBLISH or SUBSCRIBE by closing the
+connection, so this showed up as reconnect loops rather than errors. To roll
+back: `aws iot set-default-policy-version --policy-name meter-energy-002-policy --policy-version-id <n>`.
 
 The certificate originally had **no policy attached**, which is why every
 connection was refused. A certificate with zero policies is denied
@@ -38,9 +47,8 @@ CONNACK — indistinguishable at the modem from a bad certificate.
 Do not attach `energy-meter-002-Policy`: it is the unmodified AWS sample policy
 (`sdk/test/*`, `client/sdk-java`) and grants nothing this device needs.
 
-Note the topic scope uses **underscores** (`energy_meter_002/*`) while the thing
-uses hyphens (`energy-meter-002`). That is why `MQTT_CLIENT_ID` and the topics
-are separate macros in `config.h`.
+Thing name, client ID, topic prefix and backend device_id are all
+`energy-meter-002`. See [Device identity](#device-identity).
 
 Verify the credentials at any time, without hardware — this does everything the
 firmware's modem does, so a PASS here means any later failure is the modem, the
@@ -48,9 +56,12 @@ SIM or the wiring, never the credentials:
 
 ```bash
 python tools/iot_selftest.py \
-    --subscribe energy_meter_002/cmd \
-    --publish   energy_meter_002/selftest
+    --subscribe energy-meter-002/cmd \
+    --publish   energy-meter-002/selftest
 ```
+
+Publish to `/selftest`, not `/data`. The backend ingests everything on
+`*/data` into the production database.
 
 ## How it works
 
@@ -95,19 +106,20 @@ a missing file — both surface as `+CMQTTCONNECT: 0,32`.
 
 ## Device identity
 
-`energy_meter_2_firmware/include/config.h` keeps two names apart on purpose:
+One name, `energy-meter-002`, is used everywhere:
 
-| macro | value | must match |
+| where | value | why it must match |
 |---|---|---|
-| `AWS_THING_NAME` | `energy-meter-002` | the AWS IoT thing name; the IoT policy scopes `iot:Connect` to `client/${iot:Connection.Thing.ThingName}`, so `MQTT_CLIENT_ID` is derived from it |
-| `DEVICE_ID` | `energy_meter_002` | the backend's id for this meter; `mqtt_worker.py` subscribes to `+/data` and takes `device_id` from the topic prefix |
+| AWS IoT thing | `energy-meter-002` | the certificate is attached to it |
+| `MQTT_CLIENT_ID` | `energy-meter-002` | `${iot:Connection.Thing.ThingName}` is only filled in when client ID = thing name; the device's `/cmd` rights depend on it |
+| `DEVICE_ID` / topic prefix | `energy-meter-002` | the backend takes device_id from the topic |
+| `public.device` row | `energy-meter-002`, `payload_profile = energywise_pzem_v1` | selects the PZEM decoder |
 
-Topics are built from `DEVICE_ID`, so the existing backend registration keeps
-working. If the IoT policy also scopes `iot:Publish`/`iot:Subscribe` to
-`topic/${iot:Connection.Thing.ThingName}/...` rather than `topic/*`, the topics
-must move to `AWS_THING_NAME` **and** that id must be registered in the backend
-(`devices`, `device_profile`, `device_ct_config`) or every reading is
-quarantined to S3 under `unmapped/`.
+There is a second, unrelated row, `energy_meter_002` (underscores), registered
+with `payload_profile = mfm384_v1`. Publishing this meter under that name is
+**not rejected**. The MFM384 decoder accepts the PZEM frame and produces
+all-null voltage, current and energy, which then flows into the rollups
+without any error. Keep `DEVICE_ID` on the hyphenated name.
 
 ## Adding another meter
 

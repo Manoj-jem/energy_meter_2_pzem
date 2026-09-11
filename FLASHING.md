@@ -72,8 +72,8 @@ reports only as the useless `err=32`:
 ```bash
 cd energy_meter_2_pzem
 python tools/iot_selftest.py \
-    --subscribe energy_meter_002/cmd \
-    --publish   energy_meter_002/selftest
+    --subscribe energy-meter-002/cmd \
+    --publish   energy-meter-002/selftest
 ```
 
 You want `RESULT : PASS` — it exercises the same TLS 1.2 mutual handshake,
@@ -81,7 +81,8 @@ CONNECT, SUBSCRIBE and QoS1 PUBLISH the firmware does. If it fails, **fix that
 first**: no amount of flashing will help, because the device does exactly what
 this script does. The script prints a checklist for each failure mode.
 
-Verified passing on 2026-09-10 against account 481665103941.
+Verified passing on 2026-09-11 against account 481665103941 (policy version 4,
+client ID and topics `energy-meter-002`).
 
 ## 3. Flash the firmware
 

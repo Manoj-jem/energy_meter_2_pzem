@@ -376,6 +376,76 @@ static bool _sync_modem_clock() {
     return false;
 }
 
+// ── IP bearer (A76XX "app network") ─────────────────────────────────
+//
+// AT+CGATT=1 means the module is attached to the packet-switched network at
+// the signalling level -- it is NOT the same as having a usable IP bearer.
+// On the SIM7600 family (this project's -D TINY_GSM_MODEM_SIM7600 build
+// flag), CGATT alone is normally enough for the CMQTT/CHTTP "app" stacks to
+// open a socket. The physical module here identifies itself (ATI) as an
+// A7670C-LNNV -- a different chip in the same AT-command family -- and the
+// A76XX series separates attach from the app-network bearer: the app stacks
+// need AT+CNACT to bring one up first. Without it, CMQTTCONNECT's internal
+// TCP connect can fail during the TLS phase, and this module's firmware
+// reports that the same way it reports a bad certificate: err 32. This
+// firmware has been re-provisioning a verified-good certificate store and
+// still failing identically every time, with a correct clock, on an
+// endpoint independently proven to accept these exact files (see
+// tools/iot_selftest.py) -- consistent with the socket never opening at all
+// rather than a TLS-level rejection.
+//
+// AT+CNACT syntax is quoted from SIMCom's A76XX-series AT command manual;
+// it has not been confirmed against this exact module + firmware revision
+// on the bench. Every step here is non-fatal and logged: if the module
+// answers ERROR or a different shape than expected, gsm_modem_init()
+// continues exactly as it did before this change, so this cannot make a
+// working path fail. Send the log after a real attempt so the exchange can
+// be corrected if the module's replies don't match what is parsed here.
+static bool _bring_up_pdp() {
+    char line[128];
+
+    while (gsm.available()) gsm.read();
+    DBGLN("[AT] >> AT+CNACT?");
+    gsm.print("AT+CNACT?\r\n");
+    uint32_t deadline = millis() + AT_DEFAULT_TIMEOUT_MS;
+    while (millis() < deadline) {
+        if (!_read_line(line, sizeof(line), 200)) continue;
+        if (strstr(line, "+CNACT: 1,1") || strstr(line, "+CNACT: 0,1")) {
+            DBGLN("[GSM] App network bearer already active");
+            return true;
+        }
+        if (strstr(line, "OK") || strstr(line, "ERROR")) break;
+    }
+
+    char cmd[96];
+    snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", APN);
+    _at_cmd(cmd, AT_DEFAULT_TIMEOUT_MS);   // non-fatal: a SIM-provisioned default APN may already be set
+
+    DBGLN("[AT] >> AT+CNACT=1,1");
+    gsm.print("AT+CNACT=1,1\r\n");
+    bool sawOk = false;
+    deadline = millis() + 20000;   // bearer activation can take several seconds
+    while (millis() < deadline) {
+        if (!_read_line(line, sizeof(line), 200)) continue;
+        if (strstr(line, "+APP PDP: 1,ACTIVE") || strstr(line, "+CNACT: 1,1")) {
+            DBGLN("[GSM] App network bearer active");
+            return true;
+        }
+        if (strstr(line, "+APP PDP: 1,DEACTIVE")) {
+            DBGLN("[GSM] App network bearer activation reported DEACTIVE");
+            return false;
+        }
+        if (strstr(line, "ERROR")) {
+            DBGLN("[GSM] AT+CNACT=1,1 -> ERROR (module may not need it, or use different syntax)");
+            return false;
+        }
+        if (strstr(line, "OK")) sawOk = true;   // command accepted; bearer URC/query still to come
+    }
+    DBGF("[GSM] Timed out waiting for app network bearer (command %s)\n",
+         sawOk ? "was accepted" : "got no OK");
+    return false;
+}
+
 bool gsm_modem_init() {
     gsm.begin(GSM_UART_BAUD, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
     delay(100);
@@ -415,6 +485,12 @@ bool gsm_modem_init() {
     }
     if (!attached) { DBGLN("[GSM] GPRS not attached"); return false; }
     DBGLN("[GSM] GPRS attached");
+
+    // Non-fatal on purpose -- see _bring_up_pdp()'s comment. If this module
+    // turns out not to need it, logging a failed attempt here changes
+    // nothing about what happens next.
+    _bring_up_pdp();
+
     return true;
 }
 

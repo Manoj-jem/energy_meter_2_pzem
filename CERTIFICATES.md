@@ -47,10 +47,26 @@ it exists, and refuses to build if `MQTT_BROKER_HOST` is an `*.amazonaws.com`
 host while `server_ca.pem` is present, or the reverse. Either mismatch would
 otherwise compile fine and fail as err 32.
 
-**Renewing** (the server certificate is valid for 5 years, the CA for 25):
+**Certificate dates are constrained by the modem.** The first CA issued for
+this domain expired in 2051. X.509 requires dates after 2049 to be encoded as
+`GeneralizedTime`, and the A7670C would not use that CA: every connect failed
+immediately with `+CMQTTCONNECT: 0,34` ("open session failed"), while TLS
+without CA verification worked. The CA was reissued the same day, shaped like
+Amazon Root CA 1, which the modem accepts:
+- it expires **31 Dec 2037**, before the 2038 32-bit time limit, encoded as `UTCTime`
+- no path-length constraint
+- both certificates are backdated one day, to tolerate a lagging modem clock
+
+`tools/make_iot_server_cert.py` enforces all of this and warns if it is given
+an older CA. The replaced CA is kept in
+`~/.energy-meter-iot-ca/replaced-<timestamp>/`.
+
+**Renewing** (the server certificate lasts 5 years, the CA until 2037-12-31):
 re-run `tools/make_iot_server_cert.sh iot.energywise.tech`, which reuses the
 CA, then re-import into the same ACM ARN (the script prints the command). No
 firmware change is needed, because devices trust the CA, not the leaf.
+**Before 2037**, issue a new CA with `--new-ca` and roll out firmware that
+carries the new `server_ca.pem`.
 
 **Setting it up again or for another account:**
 `tools/setup_iot_custom_domain.sh <fqdn> certs|domain|verify`. It refuses to

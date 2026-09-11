@@ -77,7 +77,7 @@ energy_meter_2_pzem/certs/energy-meter-002/device.private.key
 That directory should now hold these files:
 
 ```
-server_ca.pem          1216 bytes   the CA the modem trusts (iot.energywise.tech)
+server_ca.pem          1188 bytes   the CA the modem trusts (iot.energywise.tech)
 AmazonRootCA1.pem      1187 bytes   kept for reference; not used while server_ca.pem exists
 device.cert.pem        1220 bytes
 device.private.key     1679 bytes
@@ -201,7 +201,7 @@ pio device monitor -b 115200
 [CERT] *** RE-PROVISIONING MODEM CERT STORE ***
 [CERT]   reason: files missing — ...
 [CERT]   uploading energy-meter-002 serial=46E4A726... valid 2026-09-10 -> 2049-12-31
-[CERT] em002_ca.pem: writing 1216 bytes...
+[CERT] em002_ca.pem: writing 1188 bytes...
 [CERT] em002_ca.pem: stored
 [CERT] em002_cert.pem: writing 1220 bytes...
 [CERT] em002_cert.pem: stored

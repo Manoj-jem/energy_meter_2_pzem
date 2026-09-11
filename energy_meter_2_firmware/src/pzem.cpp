@@ -29,19 +29,32 @@ static uint16_t crc16(const uint8_t* data, uint16_t len) {
     return crc;
 }
 
+// Crossed-wire self-check (see pzem_read): per channel, whether its RX/TX
+// pins are used swapped, and whether the swap has already been tried.
+static bool _swapped[4]     = {false, false, false, false};
+static bool _swapProbed[4]  = {false, false, false, false};
+
+static bool channel_pins(uint8_t channel, int8_t* rx, int8_t* tx) {
+    switch (channel) {
+        case 1: *rx = PZEM1_RX_PIN; *tx = PZEM1_TX_PIN; return true;
+        case 2: *rx = PZEM2_RX_PIN; *tx = PZEM2_TX_PIN; return true;
+        case 3: *rx = PZEM3_RX_PIN; *tx = PZEM3_TX_PIN; return true;
+        default: return false;
+    }
+}
+
 static bool bind_channel(uint8_t channel) {
     // Stop the previous pin mapping before assigning a new one.
     pzemSerial.end();
 
     int8_t rx = -1;
     int8_t tx = -1;
-    switch (channel) {
-        case 1: rx = PZEM1_RX_PIN; tx = PZEM1_TX_PIN; break;
-        case 2: rx = PZEM2_RX_PIN; tx = PZEM2_TX_PIN; break;
-        case 3: rx = PZEM3_RX_PIN; tx = PZEM3_TX_PIN; break;
-        default:
-            DBGF("[PZEM] Invalid channel %u\n", channel);
-            return false;
+    if (!channel_pins(channel, &rx, &tx)) {
+        DBGF("[PZEM] Invalid channel %u\n", channel);
+        return false;
+    }
+    if (_swapped[channel]) {
+        const int8_t t = rx; rx = tx; tx = t;
     }
 
     pzemSerial.begin(PZEM_BAUD, SERIAL_8N1, rx, tx);
@@ -134,7 +147,34 @@ PzemReading pzem_read(uint8_t slaveAddr, uint8_t channel) {
     send_frame(request, sizeof(request));
 
     uint8_t response[25] = {};
-    const uint8_t rxLen = recv_frame(response, sizeof(response), 25);
+    uint8_t rxLen = recv_frame(response, sizeof(response), 25);
+
+    // Each PZEM is alone on its pin pair and is queried on the general
+    // address, so silence means wiring, not addressing. Once per boot, try the
+    // pair the other way round: a PZEM whose TX wire sits on the ESP32's TX
+    // pin answers then, and the log says exactly which wires are crossed.
+    if (rxLen != 25 && !_swapProbed[channel]) {
+        _swapProbed[channel] = true;
+        _swapped[channel] = true;
+        int8_t rx = -1, tx = -1;
+        channel_pins(channel, &rx, &tx);
+        DBGF("[PZEM] CH%u: no reply - retrying once with RX/TX swapped\n", channel);
+        bind_channel(channel);
+        flush_rx();
+        send_frame(request, sizeof(request));
+        rxLen = recv_frame(response, sizeof(response), 25);
+        if (rxLen == 25) {
+            DBGF("[PZEM] CH%u WARNING: answers only with RX/TX SWAPPED - the PZEM's TX wire is on "
+                 "GPIO%d (defined as its TX pin) and its RX wire on GPIO%d. Using the swapped pins "
+                 "until reboot; fix the wiring.\n", channel, tx, rx);
+        } else {
+            _swapped[channel] = false;
+            DBGF("[PZEM] CH%u: no reply either way - nothing answers on GPIO%d/GPIO%d. Check the PZEM's "
+                 "5V/GND and mains, and that its wires are on these GPIO numbers (not board labels).\n",
+                 channel, rx, tx);
+        }
+    }
+
     if (rxLen != 25) {
         DBGF("[PZEM] CH%u addr 0x%02X: no valid response\n", channel, slaveAddr);
         unbind_pzem();

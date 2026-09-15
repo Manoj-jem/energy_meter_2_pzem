@@ -109,9 +109,10 @@ One PlatformIO environment per meter; the default is energy-meter-002.
 |---|---|---|
 | energy-meter-002 | `pio run -t upload` | `energy-meter-002/data` |
 | energy-meter-3 | `pio run -e energy-meter-3 -t upload` | `energy-meter-3/data` |
+| energy-meter-4 | `pio run -e energy-meter-4 -t upload` | `energy-meter-4/data` |
 
-Both use the certificate in `certs/energy-meter-002/`, attached to both AWS
-things. Never flash the same environment onto two meters: a shared client ID
+All use the certificate in `certs/energy-meter-002/`, attached to every AWS
+thing. Never flash the same environment onto two meters: a shared client ID
 makes AWS disconnect them alternately forever.
 
 **There is no separate certificate-upload step.** The firmware carries the PEMs

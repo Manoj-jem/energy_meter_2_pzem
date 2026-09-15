@@ -16,8 +16,10 @@
 // a -D flag -- see platformio.ini:
 //     pio run -e energy-meter-002 -t upload
 //     pio run -e energy-meter-3   -t upload
-// energy-meter-3 is a second AWS thing with the SAME certificate as
-// energy-meter-002 (attached non-exclusively). That is safe only because the
+//     pio run -e energy-meter-4   -t upload
+// energy-meter-3 and energy-meter-4 are further AWS things with the SAME
+// certificate as energy-meter-002 (attached non-exclusively). That is safe
+// only because the
 // client IDs differ: two connections with one client ID knock each other off
 // the broker in a loop.
 //
@@ -33,8 +35,8 @@
 //   meter, and the MFM384 decoder turns a PZEM frame into all-null readings
 //   without any error.
 //
-//   energy-meter-3 needs its own "energy-meter-3" row (payload_profile
-//   energywise_pzem_v1). Without one the backend quarantines its frames to
+//   energy-meter-3 and energy-meter-4 each need their own row with the same
+//   name (payload_profile energywise_pzem_v1). Without one the backend quarantines its frames to
 //   S3 unmapped/. The existing "energy_meter_003" row is another MFM384
 //   placeholder, not this meter.
 #ifndef AWS_THING_NAME

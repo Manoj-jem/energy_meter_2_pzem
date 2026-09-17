@@ -16,6 +16,7 @@ config.h so this can never drift from what the device actually does.
   python tools/iot_selftest.py --publish energy-meter-002/selftest
   python tools/iot_selftest.py --thing energy-meter-3 --publish energy-meter-3/selftest
   python tools/iot_selftest.py --thing energy-meter-4 --publish energy-meter-4/selftest
+  python tools/iot_selftest.py --thing energy-meter-5 --publish energy-meter-5/selftest
   python tools/iot_selftest.py --client-id some-other-id
 """
 import argparse

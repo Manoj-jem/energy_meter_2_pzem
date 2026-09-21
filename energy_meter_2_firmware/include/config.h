@@ -18,9 +18,10 @@
 //     pio run -e energy-meter-3   -t upload
 //     pio run -e energy-meter-4   -t upload
 //     pio run -e energy-meter-5   -t upload
-// energy-meter-3, energy-meter-4 and energy-meter-5 are further AWS things
-// with the SAME certificate as energy-meter-002 (attached non-exclusively).
-// That is safe only because the
+//     pio run -e energy-meter-8   -t upload
+// energy-meter-3, energy-meter-4, energy-meter-5 and energy-meter-8 are
+// further AWS things with the SAME certificate as energy-meter-002
+// (attached non-exclusively). That is safe only because the
 // client IDs differ: two connections with one client ID knock each other off
 // the broker in a loop.
 //
@@ -36,10 +37,11 @@
 //   meter, and the MFM384 decoder turns a PZEM frame into all-null readings
 //   without any error.
 //
-//   energy-meter-3, energy-meter-4 and energy-meter-5 each need their own row
-//   with the same name (payload_profile energywise_pzem_v1). Without one the
-//   backend quarantines its frames to S3 unmapped/. The existing
-//   "energy_meter_003" row is another MFM384 placeholder, not this meter.
+//   energy-meter-3, energy-meter-4, energy-meter-5 and energy-meter-8 each
+//   need their own row with the same name (payload_profile
+//   energywise_pzem_v1). Without one the backend quarantines its frames to
+//   S3 unmapped/. The existing "energy_meter_003" row is another MFM384
+//   placeholder, not this meter.
 #ifndef AWS_THING_NAME
 #define AWS_THING_NAME      "energy-meter-002"
 #endif

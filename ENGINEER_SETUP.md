@@ -173,11 +173,12 @@ other meters, pick the environment explicitly:
 pio run -e energy-meter-3 -t upload
 pio run -e energy-meter-4 -t upload
 pio run -e energy-meter-5 -t upload
+pio run -e energy-meter-9 -t upload
 ```
 
 (In VS Code, choose the environment in the status bar first.) All meters use
 the same certificate files in `certs/energy-meter-002/`, and differ only in
-thing name, client ID and topic (`energy-meter-3/data`, `energy-meter-4/data`, `energy-meter-5/data`). Double-check the
+thing name, client ID and topic (`energy-meter-3/data`, `energy-meter-4/data`, `energy-meter-5/data`, `energy-meter-9/data`). Double-check the
 environment before flashing: two meters with the same client ID knock each
 other off AWS in an endless reconnect loop. The boot log line
 `[MQTT] Identity: client_id=...` shows which one you flashed.
@@ -186,6 +187,7 @@ To check a meter's credentials first:
 `python tools/iot_selftest.py --thing energy-meter-3 --publish energy-meter-3/selftest`
 `python tools/iot_selftest.py --thing energy-meter-4 --publish energy-meter-4/selftest`
 `python tools/iot_selftest.py --thing energy-meter-5 --publish energy-meter-5/selftest`
+`python tools/iot_selftest.py --thing energy-meter-9 --publish energy-meter-9/selftest`
 
 The first build downloads the ESP32 toolchain and takes several minutes;
 later builds take about 30 seconds.

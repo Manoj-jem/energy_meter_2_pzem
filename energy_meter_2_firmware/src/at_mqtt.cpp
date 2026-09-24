@@ -1148,15 +1148,24 @@ void at_mqtt_get_timestamp(char* outBuf, size_t outBufLen) {
             p = strchr(p, '"');
             if (!p) break;
             p++;
-            int yy,mo,dd,hh,mm,ss,tz; char sign='+';
-            if (sscanf(p, "%2d/%2d/%2d,%2d:%2d:%2d%c%2d",
-                       &yy,&mo,&dd,&hh,&mm,&ss,&sign,&tz) >= 6) {
+            int yy = 0, mo = 0, dd = 0, hh = 0, mm = 0, ss = 0, tz = 0;
+            char sign = '+';
+            const int matched = sscanf(p, "%2d/%2d/%2d,%2d:%2d:%2d%c%2d",
+                                       &yy,&mo,&dd,&hh,&mm,&ss,&sign,&tz);
+            if (matched >= 6 && _year_valid(yy) &&
+                mo >= 1 && mo <= 12 && dd >= 1 && dd <= 31 &&
+                hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59 && ss >= 0 && ss <= 60) {
+                if (matched < 8) {
+                    sign = '+';
+                    tz = 0;
+                }
                 snprintf(outBuf, outBufLen,
                          "20%02d-%02d-%02dT%02d:%02d:%02d%c%02d:%02d",
                          yy,mo,dd,hh,mm,ss,sign,(tz*15)/60,(tz*15)%60);
                 DBGF("[TIME] %s\n", outBuf);
                 return;
             }
+            DBGF("[TIME] Ignoring invalid CCLK value: %s\n", p);
         }
     }
     DBGLN("[TIME] CCLK failed, using fallback");

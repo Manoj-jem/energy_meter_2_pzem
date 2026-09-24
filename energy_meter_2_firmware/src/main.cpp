@@ -174,8 +174,17 @@ void reportQueueHealth() {
 }
 
 bool publishRecord(const TelemetryRecord& record, DeliveryMode delivery) {
+    TelemetryRecord publishRecord = record;
+    if (publishRecord.event_ts_ms <= 0) {
+        const int64_t nowMs = time_service_now_ms();
+        if (nowMs > 0) {
+            publishRecord.event_ts_ms = nowMs;
+            publishRecord.time_quality = time_service_quality();
+        }
+    }
+
     char payload[MQTT_PAYLOAD_BUF_SIZE];
-    if (payload_build(record, delivery, payload, sizeof(payload)) == 0) return false;
+    if (payload_build(publishRecord, delivery, payload, sizeof(payload)) == 0) return false;
     return at_mqtt_publish(payload);
 }
 
@@ -308,13 +317,15 @@ void networkTask(void*) {
                     setModemState(MODEM_AT_READY);
                     ready = at_mqtt_connect();
                 }
+                if (ready && !time_service_sync_from_modem()) {
+                    DBGLN("[TIME] ESP32 clock sync failed after MQTT connect");
+                }
                 if (ready) ready = at_mqtt_subscribe();
                 if (ready) {
                     setModemState(MODEM_MQTT_CONNECTED);
                     wasConnected = true;
                     reconnectBackoff = 0;
                     nextConnectAt = now;
-                    time_service_sync_from_modem();
                     emitEvent(EVENT_MQTT_RECONNECTED);
                 } else {
                     setModemState(MODEM_BACKOFF);

@@ -32,6 +32,7 @@ const char* at_mqtt_err_string(int errcode) {
         case 17: return "timeout";
         case 19: return "client is used (slot already acquired)";
         case 20: return "client not acquired";
+        case 24: return "broker refused subscribe (SUBACK 0x80) — check IoT policy iot:Subscribe";
         case 25: return "DNS error";
         case 27: return "connection refused: protocol version";
         case 30: return "connection refused: bad credentials";

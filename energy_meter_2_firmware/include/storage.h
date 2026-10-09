@@ -17,3 +17,8 @@ bool storage_pop();
 bool storage_has_pending();
 void storage_flush();
 StorageStats storage_stats();
+
+// Diagnostics (see storage.cpp). Compiled always; only called from main.cpp
+// when built with -D FLASH_SELFTEST (pio run -e flashtest -t upload).
+void storage_print_status();
+bool storage_selftest(bool destructive);

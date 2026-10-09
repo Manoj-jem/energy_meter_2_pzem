@@ -390,6 +390,9 @@ void setup() {
     pzem_init();
     storageReady = storage_init();
     if (!storageReady) DBGLN("[MAIN] SPI NOR queue unavailable");
+#ifdef FLASH_SELFTEST
+    storage_selftest(true);   // before the tasks start, so nothing else touches the chip
+#endif
 
     liveQueue = xQueueCreate(LIVE_QUEUE_DEPTH, sizeof(TelemetryRecord));
     urgentQueue = xQueueCreate(URGENT_QUEUE_DEPTH, sizeof(TelemetryRecord));
@@ -416,5 +419,14 @@ void setup() {
 
 void loop() {
     esp_task_wdt_reset();
+#ifdef FLASH_SELFTEST
+    static uint32_t lastStatusAt = 0;
+    if (millis() - lastStatusAt >= 5000UL) {
+        lastStatusAt = millis();
+        storage_print_status();
+        DBGF("[FLASHTEST] pins PWR_FAIL=%d BACKUP_LOW=%d mqtt=%d\n", digitalRead(PWR_FAIL_PIN),
+             digitalRead(BACKUP_LOW_PIN), at_mqtt_is_connected());
+    }
+#endif
     delay(1000);
 }

@@ -390,6 +390,164 @@ void storage_flush() {
     xSemaphoreGive(flashMutex);
 }
 
+void storage_print_status() {
+    if (flashMutex == nullptr) return;
+    xSemaphoreTake(flashMutex, portMAX_DELAY);
+    DBGF("[STORAGE] status ready=%d pending=%lu/%lu head=%lu tail=%lu dropped=%lu gen=%lu hdr=%c sinceCkpt=%lu nextOrder=%lu\n",
+         state.ready, (unsigned long)state.count, (unsigned long)SLOT_COUNT, (unsigned long)state.head,
+         (unsigned long)state.tail, (unsigned long)state.dropped, (unsigned long)state.generation,
+         state.activeHeader ? 'B' : 'A', (unsigned long)state.appendSinceCheckpoint, (unsigned long)state.nextOrder);
+    xSemaphoreGive(flashMutex);
+}
+
+// Bring-up diagnostic. Call after storage_init(), before the tasks start.
+// Non-destructive checks always run. With destructive=true the LAST 4 KB sector
+// is saved, erased, pattern-tested and restored, and (if the queue is empty) one
+// synthetic record is appended/peeked/popped to exercise the real queue path.
+bool storage_selftest(bool destructive) {
+    int failures = 0;
+    auto check = [&](const char* name, bool ok, const char* detail = "") {
+        DBGF("[FLASHTEST] %-26s %s %s\n", name, ok ? "PASS" : "FAIL", detail);
+        if (!ok) ++failures;
+    };
+
+    DBGLN("[FLASHTEST] ================ SPI NOR self-test ================");
+    if (!state.ready || flashMutex == nullptr) {
+        check("storage_init", false, "(storage not ready - JEDEC ID unsupported or mutex failed)");
+        return false;
+    }
+    xSemaphoreTake(flashMutex, portMAX_DELAY);
+
+    // 1. Chip identity and size.
+    flashSPI.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE0));
+    selectFlash();
+    flashSPI.transfer(CMD_READ_ID);
+    const uint8_t mfr = flashSPI.transfer(0x00);
+    const uint8_t type = flashSPI.transfer(0x00);
+    const uint8_t cap = flashSPI.transfer(0x00);
+    deselectFlash();
+    flashSPI.endTransaction();
+    char detail[96];
+    snprintf(detail, sizeof(detail), "(JEDEC %02X %02X %02X, chip=%lu KB, config=%lu KB)", mfr, type, cap,
+             cap < 32 ? (1UL << cap) / 1024UL : 0UL, (unsigned long)(FLASH_SIZE_BYTES / 1024UL));
+    check("jedec_id", mfr != 0x00 && mfr != 0xFF && cap < 32 && (1UL << cap) >= FLASH_SIZE_BYTES, detail);
+
+    // 2. Status register: must be idle, and not stuck write-protected by accident.
+    const uint8_t sr = flashStatus();
+    snprintf(detail, sizeof(detail), "(SR1=0x%02X BUSY=%d WEL=%d BP=%d)", sr, sr & 1, (sr >> 1) & 1, (sr >> 2) & 7);
+    check("status_idle", (sr & 0x03) == 0, detail);
+
+    // 3. Header journal.
+    HeaderEntry header{};
+    uint8_t headerIndex = 0;
+    if (findHeader(header, headerIndex)) {
+        snprintf(detail, sizeof(detail), "(sector %c gen=%lu head=%lu tail=%lu count=%lu dropped=%lu)",
+                 headerIndex ? 'B' : 'A', (unsigned long)header.generation, (unsigned long)header.head,
+                 (unsigned long)header.tail, (unsigned long)header.count, (unsigned long)header.dropped);
+        check("header_journal", true, detail);
+    } else {
+        DBGLN("[FLASHTEST] header_journal            NONE (normal on a brand-new / never-checkpointed chip)");
+    }
+
+    // 4. Full slot scan: classify every slot.
+    uint32_t blank = 0, pending = 0, delivered = 0, corrupt = 0;
+    const uint32_t scanStart = millis();
+    for (uint32_t slot = 0; slot < SLOT_COUNT; ++slot) {
+        FlashRecord candidate{};
+        flashRead(slotAddress(slot), reinterpret_cast<uint8_t*>(&candidate), sizeof(candidate));
+        if (recordValid(candidate)) {
+            if (candidate.commit == COMMIT_PENDING) ++pending; else ++delivered;
+        } else if (candidate.magic == 0xFFFFFFFFUL) {
+            ++blank;
+        } else {
+            ++corrupt;
+        }
+    }
+    snprintf(detail, sizeof(detail), "(blank=%lu pending=%lu delivered=%lu corrupt=%lu of %lu, %lu ms)",
+             (unsigned long)blank, (unsigned long)pending, (unsigned long)delivered, (unsigned long)corrupt,
+             (unsigned long)SLOT_COUNT, (unsigned long)(millis() - scanStart));
+    // Corrupt slots are expected after a power cut mid-write; they are skipped, not fatal.
+    check("slot_scan", pending == state.count, detail);
+    if (corrupt) DBGLN("[FLASHTEST] note: a few corrupt slots = write cut by power loss; thousands = old/foreign data on the chip (harmless, erased as the queue wraps)");
+
+    if (destructive) {
+        // 5. Raw sector erase / program / read-back on the last sector.
+        const uint32_t testAddr = (uint32_t)FLASH_SIZE_BYTES - SECTOR_SIZE;
+        uint8_t* saved = (uint8_t*)malloc(SECTOR_SIZE);
+        uint8_t* buf = (uint8_t*)malloc(SECTOR_SIZE);
+        if (!saved || !buf) {
+            check("alloc", false, "(need 8 KB heap)");
+        } else {
+            flashRead(testAddr, saved, SECTOR_SIZE);
+            uint32_t t0 = millis();
+            const bool erased = flashEraseSector(testAddr);
+            const uint32_t eraseMs = millis() - t0;
+            flashRead(testAddr, buf, SECTOR_SIZE);
+            bool allFF = erased;
+            for (uint32_t i = 0; i < SECTOR_SIZE && allFF; ++i) allFF = buf[i] == 0xFF;
+            snprintf(detail, sizeof(detail), "(erase %lu ms)", (unsigned long)eraseMs);
+            check("sector_erase", allFF, detail);
+
+            bool progOk = true;
+            t0 = millis();
+            for (uint32_t page = 0; page < SECTOR_SIZE / PAGE_SIZE && progOk; ++page) {
+                uint8_t pat[PAGE_SIZE];
+                for (uint32_t i = 0; i < PAGE_SIZE; ++i) pat[i] = (uint8_t)(i ^ (page * 7) ^ 0xA5);
+                progOk = flashProgram(testAddr + page * PAGE_SIZE, pat, PAGE_SIZE);
+            }
+            const uint32_t progMs = millis() - t0;
+            flashRead(testAddr, buf, SECTOR_SIZE);
+            uint32_t mismatches = 0;
+            for (uint32_t page = 0; page < SECTOR_SIZE / PAGE_SIZE; ++page)
+                for (uint32_t i = 0; i < PAGE_SIZE; ++i)
+                    if (buf[page * PAGE_SIZE + i] != (uint8_t)(i ^ (page * 7) ^ 0xA5)) ++mismatches;
+            snprintf(detail, sizeof(detail), "(16 pages in %lu ms, %lu byte mismatches)", (unsigned long)progMs,
+                     (unsigned long)mismatches);
+            check("program_readback", progOk && mismatches == 0, detail);
+
+            // Restore whatever was there (live queue data if the chip is in service).
+            bool restored = flashEraseSector(testAddr);
+            for (uint32_t page = 0; page < SECTOR_SIZE / PAGE_SIZE && restored; ++page) {
+                bool blankPage = true;
+                for (uint32_t i = 0; i < PAGE_SIZE && blankPage; ++i) blankPage = saved[page * PAGE_SIZE + i] == 0xFF;
+                if (!blankPage) restored = flashProgram(testAddr + page * PAGE_SIZE, saved + page * PAGE_SIZE, PAGE_SIZE);
+            }
+            flashRead(testAddr, buf, SECTOR_SIZE);
+            check("sector_restore", restored && memcmp(buf, saved, SECTOR_SIZE) == 0);
+        }
+        free(saved);
+        free(buf);
+    }
+    xSemaphoreGive(flashMutex);
+
+    if (destructive) {
+        // 6. Queue path: append (forced checkpoint) -> peek -> pop, only if it can't disturb real data.
+        if (state.count == 0) {
+            TelemetryRecord probe{};
+            probe.record_type = RECORD_EVENT;
+            probe.event_code = EVENT_STORAGE_READY;
+            probe.boot_id = 0xF1A5C0DE;
+            probe.seq = 0xFFFFFFF0ULL;
+            probe.event_ts_ms = (int64_t)millis();
+            const uint32_t genBefore = state.generation;
+            const bool appended = storage_append(probe, true);
+            check("queue_append", appended && state.count == 1);
+            check("checkpoint_written", state.generation == genBefore + 1);
+            TelemetryRecord out{};
+            const bool peeked = storage_peek(out);
+            check("queue_peek", peeked && memcmp(&out, &probe, sizeof(probe)) == 0);
+            check("queue_pop", storage_pop() && state.count == 0);
+            storage_flush();
+        } else {
+            DBGLN("[FLASHTEST] queue_roundtrip           SKIPPED (queue holds real pending records)");
+        }
+    }
+
+    DBGF("[FLASHTEST] RESULT: %s (%d failure%s)\n", failures ? "FAIL" : "PASS", failures, failures == 1 ? "" : "s");
+    DBGLN("[FLASHTEST] ===================================================");
+    return failures == 0;
+}
+
 StorageStats storage_stats() {
     StorageStats result{};
     result.ready = state.ready;

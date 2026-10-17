@@ -18,8 +18,8 @@
 //     pio run -e energy-meter-3   -t upload
 //     pio run -e energy-meter-4   -t upload
 //     pio run -e energy-meter-5   -t upload
-//     pio run -e energy-meter-15  -t upload
-// energy-meter-3, energy-meter-4, energy-meter-5 and energy-meter-15 are
+//     pio run -e energy-meter-23  -t upload
+// energy-meter-3, energy-meter-4, energy-meter-5 and energy-meter-23 are
 // further AWS things with the SAME certificate as energy-meter-002
 // (attached non-exclusively). That is safe only because the
 // client IDs differ: two connections with one client ID knock each other off
@@ -37,7 +37,7 @@
 //   meter, and the MFM384 decoder turns a PZEM frame into all-null readings
 //   without any error.
 //
-//   energy-meter-3, energy-meter-4, energy-meter-5 and energy-meter-15 each
+//   energy-meter-3, energy-meter-4, energy-meter-5 and energy-meter-23 each
 //   need their own row with the same name (payload_profile
 //   energywise_pzem_v1). Without one the backend quarantines its frames to
 //   S3 unmapped/. The existing "energy_meter_003" row is another MFM384

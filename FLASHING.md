@@ -194,3 +194,91 @@ pio run -t upload && pio device monitor -b 115200
 ```
 
 Re-flash the main firmware afterwards — this sketch does nothing else.
+
+## 8. Firmware 2.x: remote update (OTA) and diagnostics
+
+From firmware **2.0.0** (branch `Firmware-26`, meter `energy-meter-26`, and every new meter
+after it) a meter can be updated through its SIM, without a site visit. Meters on 1.0.0 have
+no OTA: they need **one** USB flash with a 2.x build first. Installed 1.0.0 meters are left as
+they are; the backend accepts both (`schema_version` 2 and 3).
+
+The mechanism is the gateways' (gateway_firmware/FLASHING.md section 8): the image comes as an
+**AWS IoT file stream** over the meter's existing MQTT session to `iot.energywise.tech`, in
+512-byte blocks, because the A7670C cannot open TLS to S3. It goes into the spare app slot of the
+default partition table (2 x 1.25 MB; the 2.0.0 image is ~390 KB).
+
+**AWS: nothing to set up per meter.** The meters use the same certificate as the gateways, and
+that certificate already carries `gateway-ota-stream-policy`
+(`$aws/things/${ThingName}/streams/*`). Bucket `energywise-gateway-firmware` and role
+`energywise-iot-ota-stream` are shared. A new meter only needs its thing:
+`tools/create_iot_thing.sh energy-meter-NN`.
+
+### Releasing an update
+
+1. Bump `FIRMWARE_VERSION` in `energy_meter_2_firmware/include/config.h`. The meter refuses the
+   version it already runs (unless `--force`).
+2. `python energy_meter_2_firmware/tools/run_host_tests.py` and
+   `cd energy_meter_2_firmware && pio run -e energy-meter-26`
+3. Dry run (uploads to S3 and creates the stream, sends nothing):
+   ```powershell
+   $env:AWS_PROFILE = "em-481665103941"
+   python tools/ota_release.py --env energy-meter-26 --bucket energywise-gateway-firmware
+   ```
+4. Send: the same with `--send`, or publish the printed JSON to `energy-meter-26/cmd`.
+5. Watch `energy-meter-26/cmd/ack`: `accepted, downloading` -> `progress` every 64 KB ->
+   (restart) -> `running new firmware`. About 7-10 minutes for 0.4 MB.
+
+Telemetry is not lost during the download: it goes to the flash queue and is replayed after.
+The image is accepted only if size and SHA-256 match and it carries this meter's identity marker
+(`EMPZ-ID:energy-meter-26`): an image for another meter, or a gateway image, is refused.
+
+**Trial and rollback.** The new image must reach AWS within 15 minutes, at most 3 boots;
+otherwise the previous image boots again and reports `"error":"rolled back from <version>"`.
+An update does not start while more than 1000 records wait in the flash queue (data first).
+
+| Reply | Meaning |
+|---|---|
+| `cannot subscribe to the stream topics` | stream policy missing on this certificate |
+| `stream rejected: ResourceNotFound` | wrong stream id, or the stream was deleted |
+| `no data from stream at byte N` | poor signal, retry later |
+| `sha256 mismatch` | image differs from the command: rerun the tool |
+| `image is not built for this meter` | wrong branch / env |
+| `flash backlog too large` | the meter is still replaying offline data: retry later |
+
+### Commands (`energy-meter-26/cmd`, replies on `/cmd/ack`; also as a JSON line on USB serial)
+
+| Command | Reply |
+|---|---|
+| `{"cmd":"status"}` | fw, uptime, boot_count, reset_reason, restart_cause, ota state, MQTT/modem, offline_s, ladder step, flash queue |
+| `{"cmd":"diag"}` | counters (power-ons, brown-outs, crashes, network restarts, publishes), previous boot, last network snapshot (SIM, CREG/CEREG, CSQ, stage, error), flash health (JEDEC, size, corrupt slots), heap and task stacks |
+| `{"cmd":"reboot"}` | restarts after 4 s (cause `cmd_reboot`) |
+| `{"cmd":"ota",...}` | see above |
+
+### What 2.x tells the server (schema 3)
+
+Every reading has a `diag` block: `uptime_s`, `boot_count`, `reset_reason`, `restart_cause`,
+`fast_boots`, `offline_s`, `ladder_step`, `safe_mode`, `min_free_heap`, `events_suppressed`.
+Events have a `detail` block (`ts`, `a`, `b`, `v`, `text`).
+
+| Question | Answer in the data |
+|---|---|
+| Was the power cut? | `BOOT` with `reset_reason` `power_on`, and `POWER_OUTAGE`: `detail.ts` = last alive (power still on, +-60 s), `event_ts` = power back, `detail.a` = duration s, `detail.v` = phase voltages at last alive. This board has no battery, so it cannot report *before* it dies; it proves the cut afterwards. |
+| Did it crash / boot-loop? | `CRASH_RESET` (`panic`, `task_wdt`, `int_wdt`), `fast_boots` rising; at 5 short boots in a row `SAFE_MODE` (metering + MQTT + OTA only, so it can still be fixed remotely). |
+| Was it powered but offline? | Replayed records with continuous `uptime_s` across the gap; `NET_RECOVERED` (`detail.a` = offline s, `detail.b` = highest recovery step, `detail.text` = last SIM/registration/error state); `SELF_RESTART` with `restart_cause` `net_loss`. |
+| Is the flash working? | `STORAGE_READY` (JEDEC, size, corrupt slots) at every boot, or `STORAGE_UNAVAILABLE` with the failed step, re-sent every hour. |
+
+**Network self-recovery** (offline = no acknowledged publish): 10 min -> MQTT teardown + radio
+off/on (`AT+CFUN=0/1`); 20 min -> modem reset (`AT+CRESET`); 30 min -> ESP restart (cause
+`net_loss`, the flash queue survives). After such a restart the next one waits 60 min. Each step
+is logged (`NET_RECOVERY_STEP`). The modem module has no reset/power line to the ESP32, so a
+modem that ignores AT commands can only be recovered by a power cycle; a PWRKEY or power-MOSFET
+line on the next PCB revision would fix that. Bench build with 1/2/3-minute steps:
+`pio run -e nettest -t upload`.
+
+**While offline** one reading per 30 s goes to flash (about 11 days of buffer on 8 MB; live rate
+stays 2 s). GPIO34/35 (PWR_FAIL / BACKUP_LOW) are not connected on this board and are ignored
+(`HAS_POWER_SENSE=0`): they used to float and produce thousands of false "backup low" events.
+
+**Flash format 3.** 2.x changed the record format. Data a 1.0.0 meter left on the chip is not
+replayed; it is erased as the ring reaches it. Later versions must keep format 3 or migrate it,
+because an OTA-updated meter keeps its flash.

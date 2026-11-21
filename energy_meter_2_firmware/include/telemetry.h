@@ -19,6 +19,7 @@ enum TimeQuality : uint8_t {
     TIME_ESTIMATED = 2,
 };
 
+// Codes are stored in flash and decoded by the backend: only ever APPEND.
 enum EventCode : uint8_t {
     EVENT_NORMAL = 0,
     EVENT_BOOT,
@@ -42,6 +43,14 @@ enum EventCode : uint8_t {
     EVENT_QUEUE_REPLAY_STARTED,
     EVENT_QUEUE_REPLAY_COMPLETED,
     EVENT_WATCHDOG_RESET,
+    // ── fw 2.x ──
+    EVENT_POWER_OUTAGE,       // detail_ts = last alive, event_ts = power back, detail_a = duration_s
+    EVENT_SELF_RESTART,       // previous boot ended by the firmware: diag.restart_cause says why
+    EVENT_CRASH_RESET,        // panic / interrupt watchdog / other watchdog
+    EVENT_NET_RECOVERY_STEP,  // detail_a = ladder step (1 radio cycle, 2 modem reset, 3 ESP restart)
+    EVENT_NET_RECOVERED,      // detail_a = offline_s, detail_b = highest ladder step, text = last net state
+    EVENT_SAFE_MODE,          // boot loop detected: running metering + MQTT + OTA only
+    EVENT_LAST = EVENT_SAFE_MODE,
 };
 
 enum ModemState : uint8_t {
@@ -65,6 +74,31 @@ struct HealthSnapshot {
     uint32_t dropped_records;
 };
 
+// Who/when of the device itself, captured when the record is made (so a
+// replayed record still shows the uptime it had at the time).
+struct DiagFields {
+    uint32_t uptime_s;
+    uint32_t boot_count;
+    uint32_t offline_s;          // 0 while connected
+    uint32_t min_free_heap;
+    uint16_t events_suppressed;  // by the rate limiter, this boot
+    uint8_t  reset_reason;       // ResetReason (diag_core.h), this boot
+    uint8_t  restart_cause;      // RestartCause of the previous boot, if it was a firmware restart
+    uint8_t  fast_boots;
+    uint8_t  ladder_step;
+    uint8_t  safe_mode;
+    uint8_t  reserved;
+};
+
+// Extra data for some events (zero otherwise).
+struct EventDetail {
+    int64_t  ts_ms;              // e.g. POWER_OUTAGE: last alive time
+    uint32_t a;
+    uint32_t b;
+    float    v[3];               // e.g. POWER_OUTAGE: phase voltages at last alive
+    char     text[28];           // e.g. NET_RECOVERED: "sim=1 creg=1 cereg=0 csq=9 err=32"
+};
+
 struct TelemetryRecord {
     uint8_t record_type;
     uint8_t event_code;
@@ -76,6 +110,8 @@ struct TelemetryRecord {
     int64_t event_ts_ms;
     PzemReading readings[3];
     HealthSnapshot health;
+    DiagFields diag;
+    EventDetail detail;
 };
 
 const char* event_name(EventCode code);

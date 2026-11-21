@@ -18,8 +18,8 @@
 //     pio run -e energy-meter-3   -t upload
 //     pio run -e energy-meter-4   -t upload
 //     pio run -e energy-meter-5   -t upload
-//     pio run -e energy-meter-25  -t upload
-// energy-meter-3, energy-meter-4, energy-meter-5 and energy-meter-25 are
+//     pio run -e energy-meter-26  -t upload   (also the default: pio run -t upload)
+// energy-meter-3, energy-meter-4, energy-meter-5 and energy-meter-26 are
 // further AWS things with the SAME certificate as energy-meter-002
 // (attached non-exclusively). That is safe only because the
 // client IDs differ: two connections with one client ID knock each other off
@@ -37,7 +37,7 @@
 //   meter, and the MFM384 decoder turns a PZEM frame into all-null readings
 //   without any error.
 //
-//   energy-meter-3, energy-meter-4, energy-meter-5 and energy-meter-25 each
+//   energy-meter-3, energy-meter-4, energy-meter-5 and energy-meter-26 each
 //   need their own row with the same name (payload_profile
 //   energywise_pzem_v1). Without one the backend quarantines its frames to
 //   S3 unmapped/. The existing "energy_meter_003" row is another MFM384
@@ -46,7 +46,13 @@
 #define AWS_THING_NAME      "energy-meter-002"
 #endif
 #define DEVICE_ID           AWS_THING_NAME
-#define FIRMWARE_VERSION    "1.0.0"
+// Bump with EVERY firmware change: a meter refuses an OTA image whose version
+// equals the one it runs (see ota.h). 2.0.0 = first OTA-capable meter firmware.
+#define FIRMWARE_VERSION    "2.0.0"
+
+// Payload schema. 2 = fw 1.0.x (installed meters, never updated), 3 = fw 2.x.
+// The backend dispatches on this field; v3 only ADDS fields to v2.
+#define PAYLOAD_SCHEMA_VERSION 3
 
 #define PZEM_BAUD           9600
 #define PZEM1_RX_PIN        16
@@ -76,9 +82,22 @@
 #define PWR_FAIL_PIN        34  // Active high, externally biased.
 #define BACKUP_LOW_PIN      35  // Active high, externally biased.
 
+// The meter board has NO battery / supercap and nothing on GPIO34/35: both
+// inputs float (GPIO34-39 have no internal pull), which produced thousands of
+// false BACKUP_LOW events. With 0 the inputs are ignored and power cuts are
+// proven after the fact instead (reset reason + alive journal, see diag.h).
+// Set to 1 only on hardware that really drives these pins.
+#ifndef HAS_POWER_SENSE
+#define HAS_POWER_SENSE     0
+#endif
+
 #define GSM_RX_PIN          26
 #define GSM_TX_PIN          27
 #define GSM_UART_BAUD       115200
+// The 7-pin modem module has no PWRKEY / RESET / power-enable line wired to the
+// ESP32, so the recovery ladder can only use AT commands (CFUN, CRESET) and an
+// ESP restart. A PWRKEY or power-MOSFET line on the next PCB revision would make
+// the modem-reset step a true hard reset.
 #define GSM_PWRKEY_PIN      -1
 #define GSM_RESET_PIN       -1
 
@@ -120,6 +139,7 @@
 // outside those two patterns shows up as a reconnect loop, not an error.
 #define MQTT_TOPIC_PUB      DEVICE_ID "/data"
 #define MQTT_TOPIC_SUB      DEVICE_ID "/cmd"
+#define MQTT_TOPIC_ACK      DEVICE_ID "/cmd/ack"   // command + OTA replies (covered by ThingName/*)
 #define MQTT_QOS            1
 #define MQTT_KEEPALIVE_S    60
 
@@ -134,7 +154,46 @@
 #define AT_PUB_TIMEOUT_MS       10000
 
 #define SEND_INTERVAL_MS        2000
+// While offline, one telemetry record per this interval goes to flash (events
+// always do). 30 s gives ~11 days of buffer; every 2 s would be only ~18 h.
+// Energy counters are cumulative, so no kWh is lost by thinning.
+#define OFFLINE_STORE_INTERVAL_MS 30000UL
 #define TASK_WATCHDOG_TIMEOUT_S 240
+
+// ── Network self-recovery ladder (time offline = since the last publish ack) ──
+//   L1: MQTT teardown + radio off/on (AT+CFUN=0/1), forces re-registration
+//   L2: modem reset (AT+CRESET)
+//   L3: ESP restart, cause NET_LOSS (the flash queue survives)
+// After a NET_LOSS restart the next L3 waits NET_L3_REPEAT_MS, never sooner.
+// -D NET_LADDER_FAST shrinks the timings to minutes for bench tests.
+#ifdef NET_LADDER_FAST
+#define NET_L1_MS               (1UL * 60UL * 1000UL)
+#define NET_L2_MS               (2UL * 60UL * 1000UL)
+#define NET_L3_MS               (3UL * 60UL * 1000UL)
+#define NET_L3_REPEAT_MS        (6UL * 60UL * 1000UL)
+#else
+#define NET_L1_MS               (10UL * 60UL * 1000UL)
+#define NET_L2_MS               (20UL * 60UL * 1000UL)
+#define NET_L3_MS               (30UL * 60UL * 1000UL)
+#define NET_L3_REPEAT_MS        (60UL * 60UL * 1000UL)
+#endif
+#define PUBLISH_FAILS_OFFLINE   3       // consecutive failed publishes = link is dead
+
+// ── Diagnostics ──
+#define ALIVE_INTERVAL_MS       60000UL  // "last alive" journal entry (outage start ±1 min)
+#define STABLE_UPTIME_MS        300000UL // up this long = not a boot loop
+#define SAFE_MODE_FAST_BOOTS    5        // this many short boots in a row = safe mode
+#define EVENT_RATE_MAX_PER_HOUR 6        // per event code; extra ones are only counted
+
+// ── Remote firmware update (same mechanism as gateway_firmware, see ota.h) ──
+#define MQTT_RX_PAYLOAD_MAX     1152    // one inbound message (/cmd or a 512-byte stream block)
+#define OTA_CHUNK_BYTES         32768UL
+#define OTA_CHUNK_RETRIES       3
+#define OTA_HTTP_TIMEOUT_MS     60000UL
+#define OTA_TRIAL_MAX_BOOTS     3
+#define OTA_TRIAL_CONNECT_MS    900000UL
+// An update waits while the flash backlog is larger than this: data first.
+#define OTA_MAX_BACKLOG         1000
 #define RSSI_SAMPLE_INTERVAL_MS 30000UL
 #define RSSI_LOW_RAW            10
 #define RSSI_RECOVER_RAW        14
@@ -148,9 +207,11 @@
 #define CT_PHASE2_GAIN          1.0f
 #define CT_PHASE3_GAIN          1.0f
 
-#define MQTT_PAYLOAD_BUF_SIZE   1400
+#define MQTT_PAYLOAD_BUF_SIZE   2048   // schema 3 telemetry is ~1.4 KB, events ~1.6 KB
 
+#ifndef DEBUG_DISABLED
 #define DEBUG_ENABLED
+#endif
 #ifdef DEBUG_ENABLED
   #define DBG(x)    Serial.print(x)
   #define DBGLN(x)  Serial.println(x)

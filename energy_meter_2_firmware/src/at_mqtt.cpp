@@ -13,13 +13,128 @@ static at_mqtt_message_cb _msgCallback = nullptr;
 
 
 static unsigned long _lastPingMs = 0;
+
+// Where the last connection attempt stopped, for the recovery ladder's
+// NET_RECOVERED report and {"cmd":"diag"} (see at_net_snapshot()).
+static const char* _stage = "boot";
+static int _lastConnErr = 0;
+static bool _safeMode = false;
 static const unsigned long PING_INTERVAL_MS = 45000UL;
 
+// ── Incoming MQTT messages vs. AT replies ───────────────────────────
+//
+// An inbound message is a URC block that can arrive in the middle of any AT
+// exchange:
+//   +CMQTTRXSTART: 0,<topic_len>,<payload_len>
+//   +CMQTTRXTOPIC: 0,<n>      then exactly n raw bytes
+//   +CMQTTRXPAYLOAD: 0,<n>    then exactly n raw bytes (may repeat: chunks)
+//   +CMQTTRXEND: 0
+// Every byte read from the modem goes through _feed(), which cuts these blocks
+// out (topic and payload by byte count, so their content can never look like
+// "OK" or "ERROR") and hands only the remaining lines to the AT code. Without
+// this, firmware-update blocks arriving during a publish were read as the
+// publish's reply or flushed away, and the session was declared dead.
 static char   _rxTopic[256]   = {0};
-static char   _rxPayload[512] = {0};
+static char   _rxPayload[MQTT_RX_PAYLOAD_MAX + 1] = {0};
 static size_t _rxTopicLen     = 0;
 static size_t _rxPayloadLen   = 0;
 static bool   _rxInProgress   = false;
+static bool   _rxOverflow     = false;
+enum RxRaw : uint8_t { RAW_NONE, RAW_TOPIC, RAW_PAYLOAD };
+static RxRaw  _rxRaw          = RAW_NONE;
+static size_t _rxRawLeft      = 0;
+
+static char   _line[512];      // one AT reply / URC line (raw message bytes never land here)
+static size_t _linePos        = 0;
+
+static size_t _header_len(const char* line) {
+    const char* comma = strrchr(line, ',');
+    return comma ? (size_t)atoi(comma + 1) : 0;
+}
+
+// Handles a line that belongs to the inbound-message protocol. Returns false
+// for anything else (an AT reply the caller is waiting for, or another URC).
+static bool _mqtt_rx_line(const char* line) {
+    if (strncmp(line, "+CMQTTRXSTART:", 14) == 0) {
+        _rxInProgress = true;
+        _rxOverflow = false;
+        _rxTopic[0] = '\0';   _rxTopicLen = 0;
+        _rxPayload[0] = '\0'; _rxPayloadLen = 0;
+        return true;
+    }
+    if (strncmp(line, "+CMQTTRXTOPIC:", 14) == 0) {
+        _rxRaw = RAW_TOPIC;
+        _rxRawLeft = _header_len(line);
+        return true;
+    }
+    if (strncmp(line, "+CMQTTRXPAYLOAD:", 16) == 0) {
+        _rxRaw = RAW_PAYLOAD;
+        _rxRawLeft = _header_len(line);
+        return true;
+    }
+    if (strncmp(line, "+CMQTTRXEND:", 12) == 0) {
+        if (_rxInProgress && !_rxOverflow && _msgCallback) _msgCallback(_rxTopic, _rxPayload);
+        if (_rxOverflow) DBGF("[MQTT] Dropped a %u-byte message on %s (too large)\n", (unsigned)_rxPayloadLen, _rxTopic);
+        _rxInProgress = false;
+        return true;
+    }
+    if (strstr(line, "CONNLOST") || strstr(line, "CONN_LOST")) {
+        const char* comma = strrchr(line, ',');
+        const int cause = comma ? atoi(comma + 1) : -1;
+        DBGF("[MQTT] Connection lost, cause=%d (%s)\n", cause,
+             cause == 1 ? "network error" :
+             cause == 2 ? "keepalive timeout" :
+             cause == 3 ? "broker closed connection" :
+             cause == 4 ? "heartbeat timeout" : "unknown");
+        _connected = false;
+        return true;
+    }
+    return false;
+}
+
+// Feeds one byte from the modem. Returns true when _line holds a complete line
+// that is not part of an inbound message.
+static bool _feed(char c) {
+    if (_rxRawLeft > 0) {
+        if (_rxRaw == RAW_TOPIC) {
+            if (_rxTopicLen < sizeof(_rxTopic) - 1) { _rxTopic[_rxTopicLen++] = c; _rxTopic[_rxTopicLen] = '\0'; }
+        } else if (_rxPayloadLen < sizeof(_rxPayload) - 1) {
+            _rxPayload[_rxPayloadLen++] = c;
+            _rxPayload[_rxPayloadLen] = '\0';
+        } else {
+            _rxOverflow = true;
+        }
+        if (--_rxRawLeft == 0) _rxRaw = RAW_NONE;
+        return false;
+    }
+    if (c == '\r') return false;
+    if (c != '\n') {
+        if (_linePos < sizeof(_line) - 1) _line[_linePos++] = c;
+        return false;
+    }
+    _line[_linePos] = '\0';
+    const size_t len = _linePos;
+    _linePos = 0;
+    return len > 0 && !_mqtt_rx_line(_line);
+}
+
+// Replaces "discard whatever is buffered" before a command: inbound messages
+// are still processed, stale reply lines are dropped. A partial line is kept
+// only while a message is arriving.
+static void _flush_rx() {
+    while (gsm.available()) _feed((char)gsm.read());
+    if (_linePos > 0 && !_rxInProgress) _linePos = 0;
+}
+
+// For loops waiting for the '>' data prompt: true when it arrives; any other
+// byte goes through _feed().
+static bool _prompt_char() {
+    if (!gsm.available()) return false;
+    const char c = (char)gsm.read();
+    if (c == '>' && _linePos == 0 && _rxRawLeft == 0) return true;
+    _feed(c);
+    return false;
+}
 
 const char* at_mqtt_err_string(int errcode) {
     switch (errcode) {
@@ -32,7 +147,6 @@ const char* at_mqtt_err_string(int errcode) {
         case 17: return "timeout";
         case 19: return "client is used (slot already acquired)";
         case 20: return "client not acquired";
-        case 24: return "broker refused subscribe (SUBACK 0x80) — check IoT policy iot:Subscribe";
         case 25: return "DNS error";
         case 27: return "connection refused: protocol version";
         case 30: return "connection refused: bad credentials";
@@ -44,18 +158,18 @@ const char* at_mqtt_err_string(int errcode) {
     }
 }
 
+// Next complete line that is not part of an inbound MQTT message (those are
+// dispatched to the message callback on the way).
 static bool _read_line(char* out, size_t outLen, uint32_t timeoutMs) {
-    size_t   pos      = 0;
     uint32_t deadline = millis() + timeoutMs;
     while (millis() < deadline) {
+        esp_task_wdt_reset();   // a bounded wait; keeps a slow attach from tripping the watchdog
         while (gsm.available()) {
-            char c = (char)gsm.read();
-            if (c == '\n') {
-                out[pos] = '\0';
-                if (pos > 0) { DBG("[AT] << "); DBGLN(out); return true; }
-                pos = 0;
-            } else if (c != '\r') {
-                if (pos < outLen - 1) out[pos++] = c;
+            if (_feed((char)gsm.read())) {
+                strncpy(out, _line, outLen - 1);
+                out[outLen - 1] = '\0';
+                DBG("[AT] << "); DBGLN(out);
+                return true;
             }
         }
         delay(2);
@@ -66,7 +180,7 @@ static bool _read_line(char* out, size_t outLen, uint32_t timeoutMs) {
 static bool _at_cmd(const char* cmd, uint32_t timeoutMs,
                      const char* expectOk  = "OK",
                      const char* expectErr = "ERROR") {
-    while (gsm.available()) gsm.read();
+    _flush_rx();
     DBG("[AT] >> "); DBGLN(cmd);
     gsm.print(cmd); gsm.print("\r\n");
 
@@ -100,7 +214,7 @@ static void _parse_urc_err(char* line, int* errOut) {
 
 static bool _at_cmd_two_stage(const char* cmd, const char* urcPrefix,
                                uint32_t timeoutMs, int* errOut) {
-    while (gsm.available()) gsm.read();
+    _flush_rx();
     DBG("[AT] >> "); DBGLN(cmd);
     gsm.print(cmd); gsm.print("\r\n");
 
@@ -181,7 +295,7 @@ static void _invalidate_cert_record() {
 static bool _cert_list(bool* haveCa, bool* haveCert, bool* haveKey) {
     *haveCa = *haveCert = *haveKey = false;
 
-    while (gsm.available()) gsm.read();
+    _flush_rx();
     DBGLN("[AT] >> AT+CCERTLIST");
     gsm.print("AT+CCERTLIST\r\n");
 
@@ -208,14 +322,14 @@ static bool _cert_download(const char* filename, const char* pem, size_t len) {
     _at_cmd(cmd, AT_DEFAULT_TIMEOUT_MS);
 
     snprintf(cmd, sizeof(cmd), "AT+CCERTDOWN=\"%s\",%u", filename, (unsigned)len);
-    while (gsm.available()) gsm.read();
+    _flush_rx();
     DBG("[AT] >> "); DBGLN(cmd);
     gsm.print(cmd); gsm.print("\r\n");
 
     bool gotPrompt = false;
     uint32_t deadline = millis() + AT_DEFAULT_TIMEOUT_MS;
     while (millis() < deadline && !gotPrompt) {
-        if (gsm.available() && (char)gsm.read() == '>') gotPrompt = true;
+        if (_prompt_char()) gotPrompt = true;
     }
     if (!gotPrompt) {
         DBGF("[CERT] %s: no '>' prompt\n", filename);
@@ -327,7 +441,7 @@ static void _mqtt_teardown() {
 
 // Two-digit year from AT+CCLK?, or -1.
 static int _modem_year() {
-    while (gsm.available()) gsm.read();
+    _flush_rx();
     DBGLN("[AT] >> AT+CCLK?");
     gsm.print("AT+CCLK?\r\n");
 
@@ -412,7 +526,7 @@ static bool _bring_up_pdp() {
     char line[128];
 
     // AT+NETOPEN? -> "+NETOPEN: 1" if already open. A fresh boot answers 0.
-    while (gsm.available()) gsm.read();
+    _flush_rx();
     DBGLN("[AT] >> AT+NETOPEN?");
     gsm.print("AT+NETOPEN?\r\n");
     uint32_t deadline = millis() + AT_DEFAULT_TIMEOUT_MS;
@@ -439,7 +553,7 @@ static bool _bring_up_pdp() {
     }
     if (!opened && !alreadyOpen) {
         DBGLN("[GSM] AT+NETOPEN failed -- trying AT+CNACT=1,1 as a fallback (different chip family)");
-        while (gsm.available()) gsm.read();
+        _flush_rx();
         gsm.print("AT+CNACT=1,1\r\n");
         deadline = millis() + 20000;
         while (millis() < deadline) {
@@ -452,7 +566,7 @@ static bool _bring_up_pdp() {
     }
 
     // Confirm with an IP, not just OK -- AT+IPADDR -> "+IPADDR: <ip>".
-    while (gsm.available()) gsm.read();
+    _flush_rx();
     DBGLN("[AT] >> AT+IPADDR");
     gsm.print("AT+IPADDR\r\n");
     deadline = millis() + AT_DEFAULT_TIMEOUT_MS;
@@ -469,7 +583,18 @@ static bool _bring_up_pdp() {
 }
 
 bool gsm_modem_init() {
+    // The default 256-byte UART buffer overflows on a ~1 KB /cmd message that arrives
+    // while the network task is busy publishing. The size only takes effect before
+    // begin(), and this function re-runs after every failed attach, so end() first.
+    gsm.end();
+    // Firmware-update blocks arrive back to back while a flash sector erase
+    // can stall the reader for ~100 ms; 8 KB holds a whole request window.
+    gsm.setRxBufferSize(8192);
     gsm.begin(GSM_UART_BAUD, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
+    _linePos = 0;
+    _rxRaw = RAW_NONE;
+    _rxRawLeft = 0;
+    _rxInProgress = false;
     delay(100);
 
     if (GSM_PWRKEY_PIN >= 0) {
@@ -479,6 +604,7 @@ bool gsm_modem_init() {
         digitalWrite(GSM_PWRKEY_PIN, HIGH); delay(3000);
     }
 
+    _stage = "at";
     DBGLN("[GSM] Waking modem...");
     bool awake = false;
     for (int i = 0; i < 10 && !awake; i++) {
@@ -490,11 +616,12 @@ bool gsm_modem_init() {
     _at_cmd("AT+CMEE=2", AT_DEFAULT_TIMEOUT_MS);
     _at_cmd("ATI", AT_DEFAULT_TIMEOUT_MS);   // model + firmware revision, for support logs
 
+    _stage = "attach";
     DBGLN("[GSM] Waiting for GPRS...");
     bool attached = false;
     char line[128];
     for (int i = 0; i < 15 && !attached; i++) {
-        while (gsm.available()) gsm.read();
+        _flush_rx();
         gsm.print("AT+CGATT?\r\n");
         uint32_t d = millis() + AT_DEFAULT_TIMEOUT_MS;
         while (millis() < d) {
@@ -573,7 +700,7 @@ static int _diag_attempt(const char* label, const char* url, int serverType, int
 static bool _modem_resolve(const char* host, char* ip, size_t ipLen) {
     char cmd[160];
     snprintf(cmd, sizeof(cmd), "AT+CDNSGIP=\"%s\"", host);
-    while (gsm.available()) gsm.read();
+    _flush_rx();
     DBG("[AT] >> "); DBGLN(cmd);
     gsm.print(cmd); gsm.print("\r\n");
 
@@ -615,7 +742,7 @@ static void _diag_clienthello() {
     _at_cmd("AT+HTTPPARA=\"SSLCFG\",0", 5000);       // use SSL context 0, as CMQTT does
 
     int method = -1, status = -1, len = -1;
-    while (gsm.available()) gsm.read();
+    _flush_rx();
     DBGLN("[AT] >> AT+HTTPACTION=0");
     gsm.print("AT+HTTPACTION=0\r\n");
     uint32_t deadline = millis() + 30000;
@@ -630,7 +757,7 @@ static void _diag_clienthello() {
     if (status == 200 && len > 0) {
         char cmd[40];
         snprintf(cmd, sizeof(cmd), "AT+HTTPREAD=0,%d", len > 1900 ? 1900 : len);
-        while (gsm.available()) gsm.read();
+        _flush_rx();
         DBG("[AT] >> "); DBGLN(cmd);
         gsm.print(cmd); gsm.print("\r\n");
         deadline = millis() + 10000;
@@ -663,7 +790,7 @@ static int _diag_https_status(const char* label, const char* url) {
     _at_cmd("AT+HTTPPARA=\"SSLCFG\",0", 5000);
 
     int method = -1, status = -1, len = -1;
-    while (gsm.available()) gsm.read();
+    _flush_rx();
     DBGLN("[AT] >> AT+HTTPACTION=0");
     gsm.print("AT+HTTPACTION=0\r\n");
     const uint32_t t0 = millis();
@@ -842,6 +969,8 @@ bool at_mqtt_connect() {
     // Blocking: without a usable cert store the handshake cannot succeed, so
     // fail fast and let networkTask's backoff retry rather than burning the
     // 20 s CMQTTCONNECT timeout on a connection that is already doomed.
+    _stage = "certs";
+    _lastConnErr = 0;
     if (!at_mqtt_provision_certs()) {
         DBGLN("[MQTT] Cert store not usable — aborting connect attempt");
         return false;
@@ -854,6 +983,7 @@ bool at_mqtt_connect() {
     DBGF("[MQTT] Identity: client_id=%s thing=%s device_id=%s topic=%s\n",
          MQTT_CLIENT_ID, AWS_THING_NAME, DEVICE_ID, MQTT_TOPIC_PUB);
 
+    _stage = "ssl_cfg";
     DBGLN("[MQTT] Configuring SSL (mTLS)...");
     // 4 = "ALL": the module negotiates, and against AWS IoT that lands on
     // TLS 1.2. This is exactly what energy_meter_firmware (meter 001) sends in
@@ -883,6 +1013,7 @@ bool at_mqtt_connect() {
     snprintf(cmdBuf, sizeof(cmdBuf), "AT+CSSLCFG=\"clientkey\",0,\"%s\"",  CERT_FILENAME_KEY);
     if (!_at_cmd(cmdBuf, AT_DEFAULT_TIMEOUT_MS)) { DBGLN("[MQTT] clientkey failed");  return false; }
 
+    _stage = "mqtt_start";
     DBGLN("[MQTT] Starting CMQTT service...");
     if (_at_cmd_two_stage("AT+CMQTTSTART", "+CMQTTSTART:", AT_DEFAULT_TIMEOUT_MS * 2, &err)) {
         if (err != 0) { DBGF("[MQTT] CMQTTSTART failed err=%d\n", err); return false; }
@@ -901,11 +1032,13 @@ bool at_mqtt_connect() {
              "AT+CMQTTCONNECT=0,\"tcp://%s:%d\",%d,1",
              MQTT_BROKER_HOST, MQTT_BROKER_PORT, MQTT_KEEPALIVE_S);
 
+    _stage = "connect";
     DBGLN("[MQTT] Connecting to AWS IoT...");
     if (!_at_cmd_two_stage(cmdBuf, "+CMQTTCONNECT:", AT_CONNECT_TIMEOUT_MS, &err)) {
         DBGLN("[MQTT] CMQTTCONNECT no response"); return false;
     }
     if (err != 0) {
+        _lastConnErr = err;
         DBGF("[MQTT] Connect failed err=%d (%s)\n", err, at_mqtt_err_string(err));
         // err 32/33/34 all mean "the TLS handshake never completed", which has
         // several unrelated causes the modem cannot distinguish. Spell them out
@@ -922,12 +1055,12 @@ bool at_mqtt_connect() {
                   _year_valid(yy) ? "OK" : "WRONG - the modem would reject AWS's certificate");
             DBGLN("[MQTT]     (this device's own cert start date is checked by AWS, not by the modem)");
 
-            if (!_tlsDiagDone) {
+            if (!_tlsDiagDone && !_safeMode) {
                 _tlsDiagDone = true;
                 _run_tls_diagnostics();
             }
 
-            if (++_tlsFailStreak >= TLS_FAILS_BEFORE_REUPLOAD) {
+            if (!_safeMode && ++_tlsFailStreak >= TLS_FAILS_BEFORE_REUPLOAD) {
                 DBGF("[CERT] %u TLS failures in a row - discarding the NVS record so "
                      "the next attempt re-uploads all three files\n", (unsigned)_tlsFailStreak);
                 _invalidate_cert_record();
@@ -942,6 +1075,7 @@ bool at_mqtt_connect() {
         return false;
     }
 
+    _stage = "connected";
     DBGLN("[MQTT] Connected to AWS IoT");
     _tlsFailStreak = 0;
     _connected  = true;
@@ -949,52 +1083,54 @@ bool at_mqtt_connect() {
     return true;
 }
 
-bool at_mqtt_publish(const char* payload) {
+bool at_mqtt_publish(const char* payload) { return at_mqtt_publish_to(MQTT_TOPIC_PUB, payload); }
+
+bool at_mqtt_publish_to(const char* topic, const char* payload) {
     if (!_connected) { DBGLN("[MQTT] Not connected"); return false; }
     
         // Flush any stale bytes in the modem UART buffer — these can
     // arrive from electrical noise during PZEM UART remapping
-    while (gsm.available()) gsm.read();
+    _flush_rx();
     delay(20);   // brief settle before sending AT commands
 
 
     _publishing = true;
 
     char   cmdBuf[64];
-    size_t topicLen   = strlen(MQTT_TOPIC_PUB);
+    size_t topicLen   = strlen(topic);
     size_t payloadLen = strlen(payload);
     char   line[256];
     bool   result = false;
   
     snprintf(cmdBuf, sizeof(cmdBuf), "AT+CMQTTTOPIC=0,%u", (unsigned)topicLen);
-    while (gsm.available()) gsm.read();
+    _flush_rx();
     DBG("[AT] >> "); DBGLN(cmdBuf);
     gsm.print(cmdBuf); gsm.print("\r\n");
 
     bool gotPrompt = false;
     uint32_t d = millis() + AT_DEFAULT_TIMEOUT_MS;
     while (millis() < d) {
-        if (gsm.available() && (char)gsm.read() == '>') { gotPrompt = true; break; }
+        if (_prompt_char()) { gotPrompt = true; break; }
     }
     if (!gotPrompt) {
         DBGLN("[MQTT] No > for TOPIC — session dead, forcing reconnect");
         _connected = false;
         goto publish_done;
     }
-    gsm.print(MQTT_TOPIC_PUB);
+    gsm.print(topic);
     if (!_read_line(line, sizeof(line), AT_DEFAULT_TIMEOUT_MS) || !strstr(line, "OK"))
         { DBGLN("[MQTT] Topic rejected"); _connected = false; goto publish_done; }
 
 
     snprintf(cmdBuf, sizeof(cmdBuf), "AT+CMQTTPAYLOAD=0,%u", (unsigned)payloadLen);
-    while (gsm.available()) gsm.read();
+    _flush_rx();
     DBG("[AT] >> "); DBGLN(cmdBuf);
     gsm.print(cmdBuf); gsm.print("\r\n");
 
     gotPrompt = false;
     d = millis() + AT_DEFAULT_TIMEOUT_MS;
     while (millis() < d) {
-        if (gsm.available() && (char)gsm.read() == '>') { gotPrompt = true; break; }
+        if (_prompt_char()) { gotPrompt = true; break; }
     }
     if (!gotPrompt) {
         DBGLN("[MQTT] No > for PAYLOAD — session dead, forcing reconnect");
@@ -1028,26 +1164,28 @@ publish_done:
     return result;
 }
 
-bool at_mqtt_subscribe() {
+bool at_mqtt_subscribe() { return at_mqtt_subscribe_topic(MQTT_TOPIC_SUB); }
+
+bool at_mqtt_subscribe_topic(const char* topic) {
     if (!_connected) { DBGLN("[MQTT] Not connected"); return false; }
 
     char   cmdBuf[64];
-    size_t topicLen = strlen(MQTT_TOPIC_SUB);
+    size_t topicLen = strlen(topic);
     char   line[256];
 
     snprintf(cmdBuf, sizeof(cmdBuf), "AT+CMQTTSUBTOPIC=0,%u,%d",
              (unsigned)topicLen, MQTT_QOS);
-    while (gsm.available()) gsm.read();
+    _flush_rx();
     DBG("[AT] >> "); DBGLN(cmdBuf);
     gsm.print(cmdBuf); gsm.print("\r\n");
 
     bool gotPrompt = false;
     uint32_t d = millis() + AT_DEFAULT_TIMEOUT_MS;
     while (millis() < d) {
-        if (gsm.available() && (char)gsm.read() == '>') { gotPrompt = true; break; }
+        if (_prompt_char()) { gotPrompt = true; break; }
     }
     if (!gotPrompt) { DBGLN("[MQTT] No > for SUBTOPIC"); return false; }
-    gsm.print(MQTT_TOPIC_SUB);
+    gsm.print(topic);
     if (!_read_line(line, sizeof(line), AT_DEFAULT_TIMEOUT_MS) || !strstr(line, "OK"))
         { DBGLN("[MQTT] Subtopic rejected"); return false; }
 
@@ -1055,54 +1193,42 @@ bool at_mqtt_subscribe() {
     if (!_at_cmd_two_stage("AT+CMQTTSUB=0", "+CMQTTSUB:", AT_DEFAULT_TIMEOUT_MS, &err)) {
         DBGLN("[MQTT] CMQTTSUB no response"); return false;
     }
-    if (err == 0) { DBGF("[MQTT] Subscribed to %s\n", MQTT_TOPIC_SUB); return true; }
+    if (err == 0) { DBGF("[MQTT] Subscribed to %s\n", topic); return true; }
     DBGF("[MQTT] Subscribe failed err=%d (%s)\n", err, at_mqtt_err_string(err));
     return false;
+}
+
+bool at_mqtt_unsubscribe_topic(const char* topic) {
+    if (!_connected) return false;
+
+    char cmdBuf[64];
+    char line[256];
+    snprintf(cmdBuf, sizeof(cmdBuf), "AT+CMQTTUNSUBTOPIC=0,%u", (unsigned)strlen(topic));
+    _flush_rx();
+    DBG("[AT] >> "); DBGLN(cmdBuf);
+    gsm.print(cmdBuf); gsm.print("\r\n");
+
+    bool gotPrompt = false;
+    uint32_t d = millis() + AT_DEFAULT_TIMEOUT_MS;
+    while (millis() < d) {
+        if (_prompt_char()) { gotPrompt = true; break; }
+    }
+    if (!gotPrompt) { DBGLN("[MQTT] No > for UNSUBTOPIC"); return false; }
+    gsm.print(topic);
+    if (!_read_line(line, sizeof(line), AT_DEFAULT_TIMEOUT_MS) || !strstr(line, "OK")) return false;
+
+    int err = -1;
+    if (!_at_cmd_two_stage("AT+CMQTTUNSUB=0,0", "+CMQTTUNSUB:", AT_DEFAULT_TIMEOUT_MS, &err)) return false;
+    DBGF("[MQTT] Unsubscribed from %s (err=%d)\n", topic, err);
+    return err == 0;
 }
 
 void at_mqtt_poll() {
     if (_publishing) return;
 
-    static char  lineBuf[600];
-    static size_t linePos = 0;
-
+    // Inbound messages are dispatched inside _feed(); other lines are just logged.
     while (gsm.available()) {
-        char c = (char)gsm.read();
-        if (c == '\n') {
-            lineBuf[linePos] = '\0';
-            linePos = 0;
-            if (strlen(lineBuf) == 0) continue;
-            DBG("[URC] "); DBGLN(lineBuf);
-
-            if (strstr(lineBuf, "+CMQTTRXSTART:")) {
-                _rxInProgress = true;
-                _rxTopic[0] = '\0'; _rxPayload[0] = '\0';
-                _rxTopicLen = 0;    _rxPayloadLen  = 0;
-            }
-            else if (strstr(lineBuf, "+CMQTTRXEND:")) {
-                if (_msgCallback) _msgCallback(_rxTopic, _rxPayload);
-                _rxInProgress = false;
-            }
-            else if (strstr(lineBuf, "CONNLOST") || strstr(lineBuf, "CONN_LOST")) {
-                char* comma = strrchr(lineBuf, ',');
-                int cause = comma ? atoi(comma + 1) : -1;
-                DBGF("[MQTT] Connection lost, cause=%d (%s)\n",
-                     cause,
-                     cause == 1 ? "network error" :
-                     cause == 2 ? "keepalive timeout" :
-                     cause == 3 ? "broker closed connection" :
-                     cause == 4 ? "heartbeat timeout" : "unknown");
-                _connected = false;
-            }
-            else if (_rxInProgress && !strstr(lineBuf, "+CMQTT")) {
-                if (strlen(_rxTopic) == 0 && _rxTopicLen == 0)
-                    { strncpy(_rxTopic,   lineBuf, sizeof(_rxTopic)   - 1); _rxTopicLen   = strlen(_rxTopic); }
-                else if (strlen(_rxPayload) == 0)
-                    { strncpy(_rxPayload, lineBuf, sizeof(_rxPayload) - 1); _rxPayloadLen = strlen(_rxPayload); }
-            }
-        } else if (c != '\r') {
-            if (linePos < sizeof(lineBuf) - 1) lineBuf[linePos++] = c;
-        }
+        if (_feed((char)gsm.read())) { DBG("[URC] "); DBGLN(_line); }
     }
 }
 
@@ -1137,7 +1263,7 @@ void at_mqtt_get_timestamp(char* outBuf, size_t outBufLen) {
     strncpy(outBuf, "1970-01-01T00:00:00+00:00", outBufLen - 1);
     outBuf[outBufLen - 1] = '\0';
 
-    while (gsm.available()) gsm.read();
+    _flush_rx();
     gsm.print("AT+CCLK?\r\n");
 
     char line[128];
@@ -1164,7 +1290,7 @@ void at_mqtt_get_timestamp(char* outBuf, size_t outBufLen) {
 }
 
 int at_mqtt_get_rssi_raw() {
-    while (gsm.available()) gsm.read();
+    _flush_rx();
     gsm.print("AT+CSQ\r\n");
 
     char line[128];
@@ -1187,4 +1313,217 @@ int at_mqtt_get_rssi() {
     const int raw = at_mqtt_get_rssi_raw();
     if (raw <= 0 || raw == 99) return 0;
     return -113 + raw * 2;
+}
+
+void at_mqtt_disconnect() {
+    _mqtt_teardown();
+    _connected = false;
+}
+
+// ── HTTP download (firmware update) ─────────────────────────────────
+//
+// AT+HTTPREAD=<offset>,<n> answers
+//   OK
+//   +HTTPREAD: <k>
+//   <exactly k raw bytes>
+//   +HTTPREAD: 0
+// The body is binary, so the k bytes are read by count, never as lines.
+
+static const size_t HTTP_READ_PIECE = 1024;   // well inside the 2304-byte UART RX buffer
+
+static bool _read_exact(uint8_t* out, size_t len, uint32_t timeoutMs) {
+    size_t got = 0;
+    uint32_t deadline = millis() + timeoutMs;
+    while (got < len && millis() < deadline) {
+        const int avail = gsm.available();
+        if (avail > 0) {
+            got += gsm.readBytes(out + got, min((size_t)avail, len - got));
+        } else {
+            delay(1);
+        }
+    }
+    return got == len;
+}
+
+// Reads one HTTPREAD piece at `offset` into `buf`. Returns the byte count, or -1.
+static int _http_read_piece(uint32_t offset, size_t len, uint8_t* buf) {
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "AT+HTTPREAD=%lu,%u", (unsigned long)offset, (unsigned)len);
+    _flush_rx();
+    gsm.print(cmd); gsm.print("\r\n");
+
+    char line[64];
+    int got = -1;
+    uint32_t deadline = millis() + AT_PUB_TIMEOUT_MS;
+    while (millis() < deadline) {
+        if (!_read_line(line, sizeof(line), 200)) continue;
+        if (strstr(line, "ERROR")) return -1;
+        const char* p = strstr(line, "+HTTPREAD:");
+        if (!p) continue;                               // OK, echo, blank
+        const int n = atoi(p + 10);
+        if (n <= 0) return got;                         // "+HTTPREAD: 0" closes the read
+        if ((size_t)n > len || got >= 0) return -1;     // more than asked, or a second block
+        if (!_read_exact(buf, (size_t)n, AT_PUB_TIMEOUT_MS)) return -1;
+        got = n;
+    }
+    return -1;
+}
+
+int at_http_get_range(const char* url, uint32_t from, uint32_t to, at_http_sink sink, void* ctx) {
+    static uint8_t piece[HTTP_READ_PIECE];
+    static char cmd[960];                               // a presigned URL is long
+    int status = -1;
+
+    esp_task_wdt_reset();
+    _at_cmd("AT+HTTPTERM", 3000);                       // ERROR if not initialised: fine
+    if (!_at_cmd("AT+HTTPINIT", AT_DEFAULT_TIMEOUT_MS)) { DBGLN("[HTTP] HTTPINIT failed"); return -1; }
+
+    if (snprintf(cmd, sizeof(cmd), "AT+HTTPPARA=\"URL\",\"%s\"", url) >= (int)sizeof(cmd) ||
+        !_at_cmd(cmd, AT_DEFAULT_TIMEOUT_MS)) {
+        DBGLN("[HTTP] URL rejected");
+        goto done;
+    }
+    snprintf(cmd, sizeof(cmd), "AT+HTTPPARA=\"USERDATA\",\"Range: bytes=%lu-%lu\"",
+             (unsigned long)from, (unsigned long)to);
+    if (!_at_cmd(cmd, AT_DEFAULT_TIMEOUT_MS)) { DBGLN("[HTTP] Range header rejected"); goto done; }
+    if (strncmp(url, "https://", 8) == 0) {
+        // Context 1, no server verification: the image is checked against the
+        // SHA-256 from the authenticated MQTT command instead.
+        _at_cmd("AT+CSSLCFG=\"sslversion\",1,4", AT_DEFAULT_TIMEOUT_MS);
+        _at_cmd("AT+CSSLCFG=\"authmode\",1,0",   AT_DEFAULT_TIMEOUT_MS);
+        _at_cmd("AT+CSSLCFG=\"enableSNI\",1,1",  AT_DEFAULT_TIMEOUT_MS);
+        _at_cmd("AT+CSSLCFG=\"ignorertctime\",1,1", AT_DEFAULT_TIMEOUT_MS);
+        if (!_at_cmd("AT+HTTPPARA=\"SSLCFG\",1", AT_DEFAULT_TIMEOUT_MS)) goto done;
+    }
+
+    {
+        int method = -1, len = -1;
+        char line[96];
+        _flush_rx();
+        DBGLN("[AT] >> AT+HTTPACTION=0");
+        gsm.print("AT+HTTPACTION=0\r\n");
+        uint32_t deadline = millis() + OTA_HTTP_TIMEOUT_MS;
+        while (millis() < deadline) {
+            esp_task_wdt_reset();
+            if (!_read_line(line, sizeof(line), 200)) continue;
+            const char* p = strstr(line, "+HTTPACTION:");
+            if (p && sscanf(p + 12, " %d,%d,%d", &method, &status, &len) == 3) break;
+            if (strstr(line, "ERROR")) break;
+        }
+        DBGF("[HTTP] GET bytes %lu-%lu -> status %d, %d bytes\n",
+             (unsigned long)from, (unsigned long)to, status, len);
+        // 200 is the whole file from byte 0: only usable when that is what was asked.
+        if (status != 206 && !(status == 200 && from == 0)) {
+            if (status == 200) status = -1;
+            goto done;
+        }
+
+        uint32_t offset = 0;
+        while (offset < (uint32_t)len) {
+            esp_task_wdt_reset();
+            const size_t want = min((size_t)(len - offset), HTTP_READ_PIECE);
+            const int n = _http_read_piece(offset, want, piece);
+            if (n <= 0) { DBGF("[HTTP] HTTPREAD failed at %lu\n", (unsigned long)offset); status = -1; break; }
+            if (!sink(piece, (size_t)n, ctx)) { status = -1; break; }
+            offset += (uint32_t)n;
+        }
+    }
+
+done:
+    _at_cmd("AT+HTTPTERM", 3000);
+    return status;
+}
+
+// ── Recovery ladder actions and network snapshot ────────────────────
+
+void at_mqtt_set_safe_mode(bool on) { _safeMode = on; }
+
+// Integer after "<prefix>" in the reply to `cmd` (the field-th comma-separated
+// value, 0-based), or -1.
+static int _query_int(const char* cmd, const char* prefix, int field) {
+    _flush_rx();
+    DBG("[AT] >> "); DBGLN(cmd);
+    gsm.print(cmd); gsm.print("\r\n");
+    char line[128];
+    int value = -1;
+    const uint32_t deadline = millis() + AT_DEFAULT_TIMEOUT_MS;
+    while (millis() < deadline) {
+        if (!_read_line(line, sizeof(line), 200)) continue;
+        const char* p = strstr(line, prefix);
+        if (p) {
+            p += strlen(prefix);
+            for (int i = 0; i < field && p; ++i) {
+                p = strchr(p, ',');
+                if (p) ++p;
+            }
+            if (p) {
+                while (*p == ' ') ++p;
+                value = atoi(p);
+            }
+            continue;   // wait for OK
+        }
+        if (strstr(line, "OK") || strstr(line, "ERROR")) break;
+    }
+    return value;
+}
+
+static int _query_sim_ready() {
+    _flush_rx();
+    gsm.print("AT+CPIN?\r\n");
+    char line[128];
+    int ready = -1;
+    const uint32_t deadline = millis() + AT_DEFAULT_TIMEOUT_MS;
+    while (millis() < deadline) {
+        if (!_read_line(line, sizeof(line), 200)) continue;
+        if (strstr(line, "+CPIN:")) { ready = strstr(line, "READY") ? 1 : 0; continue; }
+        if (strstr(line, "OK")) break;
+        if (strstr(line, "ERROR")) { if (ready < 0) ready = 0; break; }   // e.g. "SIM not inserted"
+    }
+    return ready;
+}
+
+void at_net_snapshot(NetSnapshot& snap) {
+    snap = NetSnapshot{};
+    snap.at_ok = _at_cmd("AT", 1500);
+    snap.sim_ready = snap.at_ok ? (int8_t)_query_sim_ready() : -1;
+    // stat: 0 not searching, 1 home, 2 searching, 3 denied, 4 unknown, 5 roaming
+    snap.creg = snap.at_ok ? (int8_t)_query_int("AT+CREG?", "+CREG:", 1) : -1;
+    snap.cereg = snap.at_ok ? (int8_t)_query_int("AT+CEREG?", "+CEREG:", 1) : -1;
+    snap.csq = snap.at_ok ? (int8_t)_query_int("AT+CSQ", "+CSQ:", 0) : -1;
+    snap.last_err = (int16_t)_lastConnErr;
+    strncpy(snap.stage, _stage, sizeof(snap.stage) - 1);
+    snprintf(snap.text, sizeof(snap.text), "sim=%d creg=%d cereg=%d csq=%d %s/%d", snap.sim_ready, snap.creg,
+             snap.cereg, snap.csq, snap.stage, snap.last_err);
+    DBGF("[NET] snapshot: at=%d %s\n", snap.at_ok, snap.text);
+}
+
+bool at_modem_radio_cycle() {
+    DBGLN("[NET] Recovery step 1: MQTT teardown + radio off/on");
+    _mqtt_teardown();
+    _connected = false;
+    _at_cmd("AT+CFUN=0", 15000);   // detach and power the RF down
+    delay(3000);
+    const bool ok = _at_cmd("AT+CFUN=1", 15000);
+    delay(5000);                   // let it search before the next attach check
+    return ok;
+}
+
+bool at_modem_reset() {
+    DBGLN("[NET] Recovery step 2: modem reset (AT+CRESET)");
+    _connected = false;
+    if (!_at_cmd("AT+CRESET", 5000)) {
+        DBGLN("[NET] CRESET not accepted - modem not answering AT");
+        return false;
+    }
+    // The module reboots: it prints RDY (and later PB DONE) when ready.
+    char line[128];
+    const uint32_t deadline = millis() + 30000;
+    while (millis() < deadline) {
+        if (_read_line(line, sizeof(line), 500) && (strstr(line, "RDY") || strstr(line, "PB DONE"))) {
+            DBGLN("[NET] Modem back after reset");
+            return true;
+        }
+    }
+    DBGLN("[NET] No RDY after CRESET (continuing)");
+    return true;
 }

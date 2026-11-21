@@ -8,6 +8,7 @@
 #include "calibration.h"
 #include "payload.h"
 #include "time_service.h"
+#include "diag_core.h"
 
 const char* event_name(EventCode code) {
     static const char* const names[] = {
@@ -17,9 +18,12 @@ const char* event_name(EventCode code) {
         "PZEM_PHASE_FAULT", "PZEM_PHASE_RECOVERED", "STORAGE_READY",
         "STORAGE_UNAVAILABLE", "QUEUE_NEAR_FULL", "QUEUE_OVERFLOW",
         "QUEUE_APPEND_FAILED", "QUEUE_REPLAY_STARTED", "QUEUE_REPLAY_COMPLETED",
-        "WATCHDOG_RESET"
+        "WATCHDOG_RESET",
+        "POWER_OUTAGE", "SELF_RESTART", "CRASH_RESET", "NET_RECOVERY_STEP", "NET_RECOVERED",
+        "SAFE_MODE"
     };
-    return code <= EVENT_WATCHDOG_RESET ? names[code] : "UNKNOWN";
+    static_assert(sizeof(names) / sizeof(names[0]) == EVENT_LAST + 1, "one name per EventCode");
+    return code <= EVENT_LAST ? names[code] : "UNKNOWN";
 }
 
 const char* modem_state_name(ModemState state) {
@@ -46,7 +50,7 @@ size_t payload_build(const TelemetryRecord& record,
 
     int written = snprintf(outBuf, outBufLen,
         "{"
-          "\"schema_version\":2,"
+          "\"schema_version\":%d,"
           "\"device_id\":\"%s\","
           "\"ts\":\"%s\","
           "\"event_ts\":\"%s\","
@@ -100,6 +104,12 @@ size_t payload_build(const TelemetryRecord& record,
             "\"pzem_valid_mask\":%u,\"pzem_alarm_mask\":%u,"
             "\"queue_depth\":%u,\"dropped_records\":%" PRIu32
           "},"
+          "\"diag\":{"
+            "\"uptime_s\":%" PRIu32 ",\"boot_count\":%" PRIu32 ",\"reset_reason\":\"%s\","
+            "\"restart_cause\":\"%s\",\"fast_boots\":%u,\"offline_s\":%" PRIu32 ","
+            "\"ladder_step\":%u,\"safe_mode\":%s,\"min_free_heap\":%" PRIu32 ","
+            "\"events_suppressed\":%u"
+          "},"
           "\"meta\":{"
             "\"fw\":\"%s\","
             "\"rssi\":%d,"
@@ -109,6 +119,7 @@ size_t payload_build(const TelemetryRecord& record,
           "}"
         "}",
 
+        PAYLOAD_SCHEMA_VERSION,
         DEVICE_ID,
         timestamp,
         timestamp,
@@ -140,6 +151,11 @@ size_t payload_build(const TelemetryRecord& record,
         record.health.pzem_valid_mask, record.health.pzem_alarm_mask,
         record.health.queue_depth, record.health.dropped_records,
 
+        record.diag.uptime_s, record.diag.boot_count, reset_reason_name(record.diag.reset_reason),
+        restart_cause_name(record.diag.restart_cause), (unsigned)record.diag.fast_boots, record.diag.offline_s,
+        (unsigned)record.diag.ladder_step, record.diag.safe_mode ? "true" : "false", record.diag.min_free_heap,
+        (unsigned)record.diag.events_suppressed,
+
         FIRMWARE_VERSION,
         record.health.rssi_raw,
         CT_PRIMARY_A, CT_SECONDARY_MA, CT_NOMINAL_MULTIPLIER,
@@ -147,10 +163,38 @@ size_t payload_build(const TelemetryRecord& record,
     );
 
     if (written < 0 || (size_t)written >= outBufLen) {
-        DBGLN("[PAYLOAD] Buffer overflow — increase mqttPayload size");
+        DBGLN("[PAYLOAD] Buffer overflow — increase MQTT_PAYLOAD_BUF_SIZE");
         return 0;
     }
 
+    // Events carry their detail: replace the final '}' with ,"detail":{...}}
+    if (record.record_type == RECORD_EVENT) {
+        const EventDetail& d = record.detail;
+        char detailTs[32];
+        time_service_format_iso8601(d.ts_ms, detailTs, sizeof(detailTs));
+        char text[sizeof(d.text) + 1];
+        size_t n = 0;
+        for (size_t i = 0; i < sizeof(d.text) && d.text[i]; ++i) {
+            const char c = d.text[i];
+            if (c != '"' && c != '\\' && c >= 0x20) text[n++] = c;   // keep the JSON valid
+        }
+        text[n] = '\0';
+        const int more = snprintf(outBuf + written - 1, outBufLen - (size_t)written + 1,
+            ",\"detail\":{\"ts\":%s%s%s,\"a\":%" PRIu32 ",\"b\":%" PRIu32 ","
+            "\"v\":[%.1f,%.1f,%.1f],\"text\":\"%s\"}}",
+            d.ts_ms > 0 ? "\"" : "", d.ts_ms > 0 ? detailTs : "null", d.ts_ms > 0 ? "\"" : "",
+            d.a, d.b, d.v[0], d.v[1], d.v[2], text);
+        if (more < 0 || (size_t)(written - 1 + more) >= outBufLen) {
+            DBGLN("[PAYLOAD] Buffer overflow (event detail)");
+            return 0;
+        }
+        written += more - 1;
+    }
+
+#ifdef DEBUG_PAYLOAD
     DBGF("[PAYLOAD] %d bytes: %s\n", written, outBuf);
+#else
+    DBGF("[PAYLOAD] %d bytes, %s\n", written, event_name((EventCode)record.event_code));
+#endif
     return (size_t)written;
 }

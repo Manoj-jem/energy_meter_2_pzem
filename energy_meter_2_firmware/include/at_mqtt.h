@@ -65,3 +65,16 @@ bool at_modem_reset();
 
 // Boot-loop safe mode: no one-shot TLS diagnosis, no cert re-upload loop.
 void at_mqtt_set_safe_mode(bool on);
+
+// ── Publish / session statistics (fw 2.0.1), since boot ──────────
+struct AtMqttStats {
+    uint32_t pub_ok;
+    uint32_t pub_failed;
+    uint32_t kept_after_fail;   // publish failed but the probe found the session alive: not dropped
+    uint32_t session_drops;     // times this driver declared the session gone
+    uint32_t connlost;          // of which: +CMQTTCONNLOST from the modem
+    uint32_t last_pub_ms;
+    uint32_t max_pub_ms;
+    char     last_drop[40];     // why the session was last dropped
+};
+AtMqttStats at_mqtt_stats();

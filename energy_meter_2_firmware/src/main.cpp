@@ -24,6 +24,7 @@
 #include "commands.h"
 #include "config.h"
 #include "diag.h"
+#include "netlog.h"
 #include "ota.h"
 #include "payload.h"
 #include "pzem.h"
@@ -80,6 +81,8 @@ uint32_t publishOk = 0;
 uint32_t publishFailed = 0;
 uint32_t reconnects = 0;
 NetSnapshot lastNet{};
+uint32_t lastNetAtS = 0;
+uint32_t downTotalS = 0;    // MQTT down time between sessions since boot (excludes the first connect)   // uptime when lastNet was taken (0 = never)
 RateLimiter limiter;
 
 // Outage proof, set at boot, sent once the clock is known.
@@ -387,6 +390,8 @@ RuntimeStatus runtimeStatus() {
     s.publishFailed = publishFailed;
     s.reconnects = reconnects;
     s.net = lastNet;
+    s.netAtS = lastNetAtS;
+    s.downTotalS = downTotalS;
     portEXIT_CRITICAL(&stateMux);
     PzemReading readings[PHASE_COUNT]{};
     copyLastReadings(readings);
@@ -530,6 +535,8 @@ void networkTask(void*) {
     uint8_t publishFailStreak = 0;
     uint8_t step = 0;                // recovery ladder step taken in this outage
     uint8_t stepMax = 0;
+    uint32_t sessionUpAt = 0;        // when the current MQTT session came up (connection log)
+    uint32_t sessionDownAt = 0;      // when it was last lost
 
     // A successful publish: the link works end to end.
     auto delivered = [&]() {
@@ -563,6 +570,7 @@ void networkTask(void*) {
         portEXIT_CRITICAL(&stateMux);
         if (++publishFailStreak >= PUBLISH_FAILS_OFFLINE && at_mqtt_is_connected()) {
             DBGLN("[NET] Publishes keep failing on an open session: tearing it down");
+            netlog_add("%u pub fails in a row: teardown", (unsigned)publishFailStreak);
             at_mqtt_disconnect();
         }
     };
@@ -584,6 +592,10 @@ void networkTask(void*) {
             if (wasConnected) {
                 wasConnected = false;
                 replayActive = false;
+                sessionDownAt = now;
+                const AtMqttStats st = at_mqtt_stats();
+                netlog_add("mqtt down after %lus up: %s", (unsigned long)((now - sessionUpAt) / 1000UL),
+                           st.last_drop[0] ? st.last_drop : "?");
                 emitEvent(EVENT_MQTT_DISCONNECTED);
             }
             if (everDelivered) deliveryLost = true;
@@ -603,6 +615,7 @@ void networkTask(void*) {
                 setDetailText(detail, lastNet.text);
                 portEXIT_CRITICAL(&stateMux);
                 // Written ahead: if the step does not help, this is the record of it.
+                netlog_add("ladder step %u after %lus offline", (unsigned)step, (unsigned long)(offlineMs / 1000UL));
                 emitEvent(EVENT_NET_RECOVERY_STEP, true, 0, &detail);
                 if (action == LADDER_RESTART) diag_restart(RC_NET_LOSS, offlineMs / 1000UL);
                 const bool ok = action == LADDER_RADIO_CYCLE ? at_modem_radio_cycle() : at_modem_reset();
@@ -614,6 +627,8 @@ void networkTask(void*) {
 
             if ((int32_t)(millis() - nextConnectAt) >= 0) {
                 setModemState(MODEM_BOOTING);
+                const uint32_t attemptAt = millis();
+                const bool fullInit = !modemInitialised;
                 bool ready = modemInitialised || gsm_modem_init();
                 modemInitialised = ready;
                 if (ready) {
@@ -630,6 +645,11 @@ void networkTask(void*) {
                     portENTER_CRITICAL(&stateMux);
                     ++reconnects;
                     portEXIT_CRITICAL(&stateMux);
+                    sessionUpAt = millis();
+                    if (sessionDownAt) downTotalS += (sessionUpAt - sessionDownAt) / 1000UL;
+                    netlog_add("mqtt up: attempt %lums%s, down %lus", (unsigned long)(sessionUpAt - attemptAt),
+                               fullInit ? " (modem init)" : "",
+                               sessionDownAt ? (unsigned long)((sessionUpAt - sessionDownAt) / 1000UL) : 0UL);
                     time_service_sync_from_modem();
                     emitEvent(EVENT_MQTT_RECONNECTED);
                     ota_on_connected();
@@ -639,7 +659,10 @@ void networkTask(void*) {
                     at_net_snapshot(snap);
                     portENTER_CRITICAL(&stateMux);
                     lastNet = snap;
+                    lastNetAtS = diag_uptime_s();
                     portEXIT_CRITICAL(&stateMux);
+                    netlog_add("connect fail %lums at=%d %s", (unsigned long)(millis() - attemptAt), snap.at_ok ? 1 : 0,
+                               snap.text);
                     setModemState(MODEM_BACKOFF);
                     EventDetail detail{};
                     detail.a = (millis() - lastGoodMs) / 1000UL;
@@ -684,7 +707,7 @@ void networkTask(void*) {
         }
 
         // A command reply goes out ahead of telemetry: the sender is waiting on it.
-        char ack[768];
+        static char ack[CMD_ACK_MAX];
         if (commands_take_ack(ack, sizeof(ack)) || ota_take_ack(ack, sizeof(ack))) {
             at_mqtt_publish_to(MQTT_TOPIC_ACK, ack);
         }
@@ -747,6 +770,7 @@ void setup() {
     DBGF("\n[MAIN] %s firmware %s\n", DEVICE_ID, FIRMWARE_VERSION);
 
     diag_boot();          // why this boot happened, before anything can restart again
+    netlog_init(diag_info().boot_count);   // connection log in RTC RAM ({"cmd":"log"})
     ota_boot_check();     // may boot the previous image instead (failed update)
     const DiagBootInfo& boot = diag_info();
 

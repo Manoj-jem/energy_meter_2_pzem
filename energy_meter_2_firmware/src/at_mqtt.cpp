@@ -5,6 +5,7 @@
 #include "config.h"
 #include "at_mqtt.h"
 #include "certs_generated.h"
+#include "netlog.h"
 
 static HardwareSerial gsm(1);
 static volatile bool _connected  = false;
@@ -20,6 +21,8 @@ static const char* _stage = "boot";
 static int _lastConnErr = 0;
 static bool _safeMode = false;
 static const unsigned long PING_INTERVAL_MS = 45000UL;
+static void _drop_session(const char* why);   // publish section
+static void _count_connlost();
 
 // ── Incoming MQTT messages vs. AT replies ───────────────────────────
 //
@@ -86,7 +89,12 @@ static bool _mqtt_rx_line(const char* line) {
              cause == 2 ? "keepalive timeout" :
              cause == 3 ? "broker closed connection" :
              cause == 4 ? "heartbeat timeout" : "unknown");
-        _connected = false;
+        char why[40];
+        snprintf(why, sizeof(why), "CONNLOST cause=%d (%s)", cause,
+                 cause == 1 ? "network" : cause == 2 ? "keepalive" : cause == 3 ? "broker closed" :
+                 cause == 4 ? "heartbeat" : "?");
+        _count_connlost();
+        _drop_session(why);
         return true;
     }
     return false;
@@ -972,6 +980,7 @@ bool at_mqtt_connect() {
     _stage = "certs";
     _lastConnErr = 0;
     if (!at_mqtt_provision_certs()) {
+        netlog_add("connect: cert store not usable");
         DBGLN("[MQTT] Cert store not usable — aborting connect attempt");
         return false;
     }
@@ -1016,7 +1025,7 @@ bool at_mqtt_connect() {
     _stage = "mqtt_start";
     DBGLN("[MQTT] Starting CMQTT service...");
     if (_at_cmd_two_stage("AT+CMQTTSTART", "+CMQTTSTART:", AT_DEFAULT_TIMEOUT_MS * 2, &err)) {
-        if (err != 0) { DBGF("[MQTT] CMQTTSTART failed err=%d\n", err); return false; }
+        if (err != 0) { DBGF("[MQTT] CMQTTSTART failed err=%d\n", err); netlog_add("cmqttstart err=%d", err); return false; }
         DBGLN("[MQTT] CMQTT service started");
     } else {
         DBGLN("[MQTT] CMQTTSTART ERROR — proceeding");
@@ -1035,11 +1044,14 @@ bool at_mqtt_connect() {
     _stage = "connect";
     DBGLN("[MQTT] Connecting to AWS IoT...");
     if (!_at_cmd_two_stage(cmdBuf, "+CMQTTCONNECT:", AT_CONNECT_TIMEOUT_MS, &err)) {
-        DBGLN("[MQTT] CMQTTCONNECT no response"); return false;
+        DBGLN("[MQTT] CMQTTCONNECT no response");
+        netlog_add("connect: no CMQTTCONNECT result");
+        return false;
     }
     if (err != 0) {
         _lastConnErr = err;
         DBGF("[MQTT] Connect failed err=%d (%s)\n", err, at_mqtt_err_string(err));
+        netlog_add("connect err=%d (%s)", err, at_mqtt_err_string(err));
         // err 32/33/34 all mean "the TLS handshake never completed", which has
         // several unrelated causes the modem cannot distinguish. Spell them out
         // so the next serial log is self-diagnosing.
@@ -1085,81 +1097,185 @@ bool at_mqtt_connect() {
 
 bool at_mqtt_publish(const char* payload) { return at_mqtt_publish_to(MQTT_TOPIC_PUB, payload); }
 
+// ── Publish (rewritten in fw 2.0.1) ─────────────────────────────────
+//
+// 2.0.0 (and every gateway / meter firmware before it) declared the session
+// dead on the FIRST hiccup in a publish: a '>' prompt that took longer than
+// 5 s, one reply line that was not "OK" (any URC arriving at that moment, e.g.
+// a network-time or PDP notification, was read as "the reply"), or a PUBACK
+// slower than 10 s while the modem itself had been told to wait 60 s. Each of
+// those set _connected = false, so networkTask tore the session down and
+// rebuilt it from scratch (1-2 min offline, readings thinned to 1 per 30 s).
+// On the bench 026 this was 31 reconnects in 3.4 h at full signal.
+//
+// Now:
+//   * replies are awaited properly: unrelated URC lines are skipped, only
+//     "OK" / "ERROR" / the expected result line end the wait;
+//   * the modem is given its own PUBACK timeout and we wait past it, so we
+//     always get its verdict instead of talking over an unfinished publish;
+//   * a failed publish is a failed publish, not a dead session. The session is
+//     only dropped when the modem says so (+CMQTTCONNLOST, "no connection"),
+//     or when a probe (AT, AT+CMQTTCONNECT?) shows it is really gone.
+//     networkTask still drops it after PUBLISH_FAILS_OFFLINE failures in a row.
+// Every failure, its step and duration go to the connection log (netlog).
+
+static AtMqttStats _stats{};
+static portMUX_TYPE _statsMux = portMUX_INITIALIZER_UNLOCKED;
+
+static void _drop_session(const char* why) {
+    const bool was = _connected;
+    _connected = false;
+    if (!was) return;
+    portENTER_CRITICAL(&_statsMux);
+    ++_stats.session_drops;
+    strncpy(_stats.last_drop, why, sizeof(_stats.last_drop) - 1);
+    _stats.last_drop[sizeof(_stats.last_drop) - 1] = '\0';
+    portEXIT_CRITICAL(&_statsMux);
+    DBGF("[MQTT] Session dropped: %s\n", why);
+    netlog_add("mqtt drop: %s", why);
+}
+
+static void _count_connlost() {
+    portENTER_CRITICAL(&_statsMux);
+    ++_stats.connlost;
+    portEXIT_CRITICAL(&_statsMux);
+}
+
+static bool _is_ok_line(const char* line) { return strcmp(line, "OK") == 0; }
+static bool _is_error_line(const char* line) { return strstr(line, "ERROR") != nullptr; }
+
+// Waits for the data prompt '>'. False on timeout or an ERROR line.
+static bool _wait_prompt(uint32_t timeoutMs) {
+    const uint32_t deadline = millis() + timeoutMs;
+    while ((int32_t)(millis() - deadline) < 0) {
+        if (!gsm.available()) { esp_task_wdt_reset(); delay(1); continue; }
+        const char c = (char)gsm.read();
+        if (c == '>' && _linePos == 0 && _rxRawLeft == 0) return true;
+        if (_feed(c)) {
+            DBG("[AT] << "); DBGLN(_line);
+            if (_is_error_line(_line)) return false;
+            // anything else is an unrelated URC: keep waiting
+        }
+    }
+    return false;
+}
+
+// Waits for the final result: 1 = OK, 0 = ERROR, -1 = timeout. URCs are skipped.
+static int _wait_result(uint32_t timeoutMs) {
+    char line[256];
+    const uint32_t deadline = millis() + timeoutMs;
+    while ((int32_t)(millis() - deadline) < 0) {
+        if (!_read_line(line, sizeof(line), 200)) continue;
+        if (_is_ok_line(line)) return 1;
+        if (_is_error_line(line)) return 0;
+    }
+    return -1;
+}
+
+// After a step went wrong: is the MQTT session still there? Sends ESC first in
+// case the modem is still in data-input mode from a prompt we missed (ESC is
+// ignored in command mode).
+static bool _session_alive(char* why, size_t whyLen) {
+    gsm.write((uint8_t)0x1B);
+    delay(300);
+    _flush_rx();
+    if (!_at_cmd("AT", 1500) && !_at_cmd("AT", 1500)) {
+        snprintf(why, whyLen, "modem not answering AT");
+        return false;
+    }
+    // Connected:  +CMQTTCONNECT: 0,"tcp://host:8883",60,1   Not connected: +CMQTTCONNECT: 0
+    _flush_rx();
+    gsm.print("AT+CMQTTCONNECT?\r\n");
+    char line[256];
+    bool connected = false, answered = false;
+    const uint32_t deadline = millis() + AT_DEFAULT_TIMEOUT_MS;
+    while ((int32_t)(millis() - deadline) < 0) {
+        if (!_read_line(line, sizeof(line), 200)) continue;
+        if (strstr(line, "+CMQTTCONNECT:")) { answered = true; connected = strstr(line, "tcp://") != nullptr; continue; }
+        if (_is_ok_line(line) || _is_error_line(line)) break;
+    }
+    if (!connected) snprintf(why, whyLen, answered ? "modem reports not connected" : "no CMQTTCONNECT? answer");
+    return connected;
+}
+
+AtMqttStats at_mqtt_stats() {
+    portENTER_CRITICAL(&_statsMux);
+    const AtMqttStats s = _stats;
+    portEXIT_CRITICAL(&_statsMux);
+    return s;
+}
+
 bool at_mqtt_publish_to(const char* topic, const char* payload) {
     if (!_connected) { DBGLN("[MQTT] Not connected"); return false; }
-    
-        // Flush any stale bytes in the modem UART buffer — these can
-    // arrive from electrical noise during PZEM UART remapping
-    _flush_rx();
-    delay(20);   // brief settle before sending AT commands
-
 
     _publishing = true;
-
+    const uint32_t started = millis();
     char   cmdBuf[64];
-    size_t topicLen   = strlen(topic);
-    size_t payloadLen = strlen(payload);
-    char   line[256];
-    bool   result = false;
-  
+    const size_t topicLen   = strlen(topic);
+    const size_t payloadLen = strlen(payload);
+    const char* failedAt = nullptr;   // step that went wrong
+    int  err = -1;
+    bool result = false;
+    bool modemSaysGone = false;
+
+    _flush_rx();
     snprintf(cmdBuf, sizeof(cmdBuf), "AT+CMQTTTOPIC=0,%u", (unsigned)topicLen);
-    _flush_rx();
     DBG("[AT] >> "); DBGLN(cmdBuf);
     gsm.print(cmdBuf); gsm.print("\r\n");
-
-    bool gotPrompt = false;
-    uint32_t d = millis() + AT_DEFAULT_TIMEOUT_MS;
-    while (millis() < d) {
-        if (_prompt_char()) { gotPrompt = true; break; }
-    }
-    if (!gotPrompt) {
-        DBGLN("[MQTT] No > for TOPIC — session dead, forcing reconnect");
-        _connected = false;
-        goto publish_done;
-    }
+    if (!_wait_prompt(AT_DEFAULT_TIMEOUT_MS)) { failedAt = "topic prompt"; goto publish_done; }
     gsm.print(topic);
-    if (!_read_line(line, sizeof(line), AT_DEFAULT_TIMEOUT_MS) || !strstr(line, "OK"))
-        { DBGLN("[MQTT] Topic rejected"); _connected = false; goto publish_done; }
+    if (_wait_result(AT_DEFAULT_TIMEOUT_MS) != 1) { failedAt = "topic reply"; goto publish_done; }
 
-
-    snprintf(cmdBuf, sizeof(cmdBuf), "AT+CMQTTPAYLOAD=0,%u", (unsigned)payloadLen);
     _flush_rx();
+    snprintf(cmdBuf, sizeof(cmdBuf), "AT+CMQTTPAYLOAD=0,%u", (unsigned)payloadLen);
     DBG("[AT] >> "); DBGLN(cmdBuf);
     gsm.print(cmdBuf); gsm.print("\r\n");
-
-    gotPrompt = false;
-    d = millis() + AT_DEFAULT_TIMEOUT_MS;
-    while (millis() < d) {
-        if (_prompt_char()) { gotPrompt = true; break; }
-    }
-    if (!gotPrompt) {
-        DBGLN("[MQTT] No > for PAYLOAD — session dead, forcing reconnect");
-        _connected = false;
-        goto publish_done;
-    }
+    if (!_wait_prompt(AT_DEFAULT_TIMEOUT_MS)) { failedAt = "payload prompt"; goto publish_done; }
     gsm.print(payload);
-    if (!_read_line(line, sizeof(line), AT_DEFAULT_TIMEOUT_MS) || !strstr(line, "OK"))
-        { DBGLN("[MQTT] Payload rejected"); goto publish_done; }
+    if (_wait_result(AT_DEFAULT_TIMEOUT_MS) != 1) { failedAt = "payload reply"; goto publish_done; }
 
-  
-    {
-        int err = -1;
-        snprintf(cmdBuf, sizeof(cmdBuf), "AT+CMQTTPUB=0,%d,60", MQTT_QOS);
-        if (!_at_cmd_two_stage(cmdBuf, "+CMQTTPUB:", AT_PUB_TIMEOUT_MS, &err)) {
-            DBGLN("[MQTT] CMQTTPUB no response — session dead, forcing reconnect");
-            _connected = false;
-            goto publish_done;
-        }
-        if (err == 0) {
-            DBGLN("[MQTT] Publish OK");
-            _lastPingMs = millis();
-            result = true;
-        } else {
-            DBGF("[MQTT] Publish failed err=%d (%s)\n", err, at_mqtt_err_string(err));
-        }
+    snprintf(cmdBuf, sizeof(cmdBuf), "AT+CMQTTPUB=0,%d,%d", MQTT_QOS, MQTT_PUB_ACK_TIMEOUT_S);
+    if (!_at_cmd_two_stage(cmdBuf, "+CMQTTPUB:", AT_PUB_WAIT_MS, &err)) { failedAt = "pub no result"; goto publish_done; }
+    if (err == 0) {
+        result = true;
+        _lastPingMs = millis();
+    } else {
+        failedAt = "pub err";
+        modemSaysGone = (err == 11);   // "no connection": the modem knows the session is gone
     }
 
 publish_done:
+    const uint32_t tookMs = millis() - started;
+    portENTER_CRITICAL(&_statsMux);
+    _stats.last_pub_ms = tookMs;
+    if (tookMs > _stats.max_pub_ms) _stats.max_pub_ms = tookMs;
+    if (result) ++_stats.pub_ok; else ++_stats.pub_failed;
+    portEXIT_CRITICAL(&_statsMux);
+
+    if (result) {
+        DBGF("[MQTT] Publish OK (%lu ms)\n", (unsigned long)tookMs);
+        if (tookMs >= PUB_SLOW_LOG_MS) netlog_add("pub slow %lums len=%u", (unsigned long)tookMs, (unsigned)payloadLen);
+    } else {
+        DBGF("[MQTT] Publish failed at %s err=%d (%s) after %lu ms\n", failedAt, err,
+             err >= 0 ? at_mqtt_err_string(err) : "-", (unsigned long)tookMs);
+        char why[40];
+        why[0] = '\0';
+        bool alive = false;
+        if (modemSaysGone) {
+            snprintf(why, sizeof(why), "pub err 11 no connection");
+        } else if (_connected) {
+            alive = _session_alive(why, sizeof(why));
+        }
+        netlog_add("pub fail %s err=%d %lums -> %s", failedAt, err, (unsigned long)tookMs,
+                   alive ? "session ok" : (why[0] ? why : "gone"));
+        if (alive) {
+            portENTER_CRITICAL(&_statsMux);
+            ++_stats.kept_after_fail;
+            portEXIT_CRITICAL(&_statsMux);
+        } else if (why[0]) {
+            _drop_session(why);
+        }
+    }
     _publishing = false;
     return result;
 }
@@ -1179,15 +1295,12 @@ bool at_mqtt_subscribe_topic(const char* topic) {
     DBG("[AT] >> "); DBGLN(cmdBuf);
     gsm.print(cmdBuf); gsm.print("\r\n");
 
-    bool gotPrompt = false;
-    uint32_t d = millis() + AT_DEFAULT_TIMEOUT_MS;
-    while (millis() < d) {
-        if (_prompt_char()) { gotPrompt = true; break; }
-    }
-    if (!gotPrompt) { DBGLN("[MQTT] No > for SUBTOPIC"); return false; }
+    const bool gotPrompt = _wait_prompt(AT_DEFAULT_TIMEOUT_MS);
+    if (!gotPrompt) { DBGLN("[MQTT] No > for SUBTOPIC"); netlog_add("sub fail: no prompt"); return false; }
     gsm.print(topic);
-    if (!_read_line(line, sizeof(line), AT_DEFAULT_TIMEOUT_MS) || !strstr(line, "OK"))
-        { DBGLN("[MQTT] Subtopic rejected"); return false; }
+    (void)line;
+    if (_wait_result(AT_DEFAULT_TIMEOUT_MS) != 1)
+        { DBGLN("[MQTT] Subtopic rejected"); netlog_add("sub fail: topic reply"); return false; }
 
     int err = -1;
     if (!_at_cmd_two_stage("AT+CMQTTSUB=0", "+CMQTTSUB:", AT_DEFAULT_TIMEOUT_MS, &err)) {
@@ -1195,6 +1308,7 @@ bool at_mqtt_subscribe_topic(const char* topic) {
     }
     if (err == 0) { DBGF("[MQTT] Subscribed to %s\n", topic); return true; }
     DBGF("[MQTT] Subscribe failed err=%d (%s)\n", err, at_mqtt_err_string(err));
+    netlog_add("sub fail err=%d", err);
     return false;
 }
 
@@ -1316,6 +1430,7 @@ int at_mqtt_get_rssi() {
 }
 
 void at_mqtt_disconnect() {
+    _drop_session("teardown by network task");
     _mqtt_teardown();
     _connected = false;
 }

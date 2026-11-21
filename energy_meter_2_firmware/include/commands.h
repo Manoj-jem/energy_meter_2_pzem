@@ -9,6 +9,8 @@
 //   {"cmd":"diag"}     counters, last network snapshot, flash health, heap and stacks
 //   {"cmd":"reboot"}   restart (cause cmd_reboot), after the reply has gone out
 //   {"cmd":"ota",...}  remote firmware update, see ota.h
+//   {"cmd":"log"}      connection log, oldest first, LOG_PAGE lines per reply:
+//                      {"cmd":"log","page":1}, ... ; {"cmd":"log","clear":true} empties it (fw 2.0.1)
 // Any command may carry "req":"<text>", echoed in the reply.
 //
 // Threading: the modem callback only copies the message into a slot; the
@@ -21,6 +23,9 @@
 
 #include "at_mqtt.h"
 
+// Largest reply (a "log" page). The network task's publish buffer uses it too.
+constexpr size_t CMD_ACK_MAX = 1400;
+
 // Filled by main.cpp for each command.
 struct RuntimeStatus {
     bool        mqttConnected;
@@ -32,6 +37,8 @@ struct RuntimeStatus {
     uint32_t    publishFailed;
     uint32_t    reconnects;
     NetSnapshot net;               // after the last failed attempt
+    uint32_t    netAtS;            // uptime when `net` was taken, 0 = never
+    uint32_t    downTotalS;        // MQTT down time between sessions since boot
     uint8_t     pzemValidMask;
     uint32_t    stackFreeMeter;    // bytes never used, per task
     uint32_t    stackFreeNetwork;

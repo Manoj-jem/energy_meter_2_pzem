@@ -48,7 +48,7 @@
 #define DEVICE_ID           AWS_THING_NAME
 // Bump with EVERY firmware change: a meter refuses an OTA image whose version
 // equals the one it runs (see ota.h). 2.0.0 = first OTA-capable meter firmware.
-#define FIRMWARE_VERSION    "2.0.0"
+#define FIRMWARE_VERSION    "2.0.1"
 
 // Payload schema. 2 = fw 1.0.x (installed meters, never updated), 3 = fw 2.x.
 // The backend dispatches on this field; v3 only ADDS fields to v2.
@@ -151,7 +151,17 @@
 
 #define AT_DEFAULT_TIMEOUT_MS   5000
 #define AT_CONNECT_TIMEOUT_MS   20000
-#define AT_PUB_TIMEOUT_MS       10000
+#define AT_PUB_TIMEOUT_MS       10000   // cert writes, HTTP reads
+
+// Publish (fw 2.0.1). The modem is told to give up on a QoS 1 PUBACK after
+// MQTT_PUB_ACK_TIMEOUT_S and we wait a little longer, so we always read the
+// modem's own verdict ("+CMQTTPUB: 0,<err>") instead of abandoning it mid-
+// publish and talking over it. 2.0.0 asked the modem for 60 s but stopped
+// listening after 10 s.
+#define MQTT_PUB_ACK_TIMEOUT_S  20
+#define AT_PUB_WAIT_MS          ((MQTT_PUB_ACK_TIMEOUT_S + 5) * 1000UL)
+// A publish slower than this is written to the connection log.
+#define PUB_SLOW_LOG_MS         5000
 
 #define SEND_INTERVAL_MS        2000
 // While offline, one telemetry record per this interval goes to flash (events

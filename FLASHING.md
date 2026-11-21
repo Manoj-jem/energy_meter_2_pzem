@@ -250,7 +250,8 @@ An update does not start while more than 1000 records wait in the flash queue (d
 | Command | Reply |
 |---|---|
 | `{"cmd":"status"}` | fw, uptime, boot_count, reset_reason, restart_cause, ota state, MQTT/modem, offline_s, ladder step, flash queue |
-| `{"cmd":"diag"}` | counters (power-ons, brown-outs, crashes, network restarts, publishes), previous boot, last network snapshot (SIM, CREG/CEREG, CSQ, stage, error), flash health (JEDEC, size, corrupt slots), heap and task stacks |
+| `{"cmd":"diag"}` | counters (power-ons, brown-outs, crashes, network restarts, publishes), previous boot, last network snapshot (SIM, CREG/CEREG, CSQ, stage, error), flash health (JEDEC, size, corrupt slots), heap and task stacks; from 2.0.1 also `mqtt` (publish ok/failed, kept_after_fail, session_drops, connlost, last/max publish ms, last_drop) and `down_total_s` |
+| `{"cmd":"log"}` / `{"cmd":"log","page":N}` | (2.0.1) connection log: the last 40 lines (publish failures, why the session dropped, reconnect times, recovery steps), 12 per reply, oldest first. Survives restarts and crashes, cleared by a power cut. `{"cmd":"log","clear":true}` empties it. See `MQTT_SESSION_DROPS.md` |
 | `{"cmd":"reboot"}` | restarts after 4 s (cause `cmd_reboot`) |
 | `{"cmd":"ota",...}` | see above |
 

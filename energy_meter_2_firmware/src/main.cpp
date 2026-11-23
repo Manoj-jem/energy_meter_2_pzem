@@ -537,6 +537,7 @@ void networkTask(void*) {
     uint8_t stepMax = 0;
     uint32_t sessionUpAt = 0;        // when the current MQTT session came up (connection log)
     uint32_t sessionDownAt = 0;      // when it was last lost
+    uint32_t lastProbeAt = 0;        // last layer probe in this outage, 0 = none yet
 
     // A successful publish: the link works end to end.
     auto delivered = [&]() {
@@ -646,6 +647,7 @@ void networkTask(void*) {
                     ++reconnects;
                     portEXIT_CRITICAL(&stateMux);
                     sessionUpAt = millis();
+                    lastProbeAt = 0;
                     if (sessionDownAt) downTotalS += (sessionUpAt - sessionDownAt) / 1000UL;
                     netlog_add("mqtt up: attempt %lums%s, down %lus", (unsigned long)(sessionUpAt - attemptAt),
                                fullInit ? " (modem init)" : "",
@@ -661,8 +663,16 @@ void networkTask(void*) {
                     lastNet = snap;
                     lastNetAtS = diag_uptime_s();
                     portEXIT_CRITICAL(&stateMux);
-                    netlog_add("connect fail %lums at=%d %s", (unsigned long)(millis() - attemptAt), snap.at_ok ? 1 : 0,
-                               snap.text);
+                    // "fail <stage> e<CMQTTCONNECT err> <s> at<0|1> q<csq> r<creg>/<cereg>"
+                    netlog_add("fail %s e%d %lus at%d q%d r%d/%d", snap.stage, (int)snap.last_err,
+                               (unsigned long)((millis() - attemptAt) / 1000UL), snap.at_ok ? 1 : 0,
+                               (int)snap.csq, (int)snap.creg, (int)snap.cereg);
+                    if (snap.at_ok && (!lastProbeAt || millis() - lastProbeAt >= NET_PROBE_EVERY_MS)) {
+                        char probe[48];
+                        at_net_probe(probe, sizeof(probe));
+                        netlog_add("probe %s", probe);
+                        lastProbeAt = millis() ? millis() : 1;
+                    }
                     setModemState(MODEM_BACKOFF);
                     EventDetail detail{};
                     detail.a = (millis() - lastGoodMs) / 1000UL;

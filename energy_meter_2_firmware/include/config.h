@@ -48,7 +48,7 @@
 #define DEVICE_ID           AWS_THING_NAME
 // Bump with EVERY firmware change: a meter refuses an OTA image whose version
 // equals the one it runs (see ota.h). 2.0.0 = first OTA-capable meter firmware.
-#define FIRMWARE_VERSION    "2.0.1"
+#define FIRMWARE_VERSION    "2.0.2"
 
 // Payload schema. 2 = fw 1.0.x (installed meters, never updated), 3 = fw 2.x.
 // The backend dispatches on this field; v3 only ADDS fields to v2.
@@ -151,6 +151,14 @@
 
 #define AT_DEFAULT_TIMEOUT_MS   5000
 #define AT_CONNECT_TIMEOUT_MS   20000
+// fw 2.0.2: the real CMQTTCONNECT waits this long. With 20 s the modem was
+// often still inside its TCP+TLS handshake when we gave up; it then connected
+// anyway and our next teardown closed it (AWS: CLIENT_INITIATED_DISCONNECT).
+// The one-shot TLS diagnosis keeps AT_CONNECT_TIMEOUT_MS.
+#define AT_MQTT_CONNECT_WAIT_MS 60000
+// fw 2.0.2: after a failed connect, test the layers below MQTT (IP, DNS, plain
+// HTTP, serving cell) at most this often; the first failure of an outage always.
+#define NET_PROBE_EVERY_MS      (10UL * 60UL * 1000UL)
 #define AT_PUB_TIMEOUT_MS       10000   // cert writes, HTTP reads
 
 // Publish (fw 2.0.1). The modem is told to give up on a QoS 1 PUBACK after

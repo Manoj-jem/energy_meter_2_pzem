@@ -19,6 +19,10 @@ static unsigned long _lastPingMs = 0;
 // NET_RECOVERED report and {"cmd":"diag"} (see at_net_snapshot()).
 static const char* _stage = "boot";
 static int _lastConnErr = 0;
+// fw 2.0.2: the data bearer may be dead although the modem reports it open.
+// True at boot (an ESP restart leaves the modem's old bearer up), after any
+// failed connect, a network CONNLOST, a bearer URC or a recovery step.
+static bool _bearerSuspect = true;
 static bool _safeMode = false;
 static const unsigned long PING_INTERVAL_MS = 45000UL;
 static void _drop_session(const char* why);   // publish section
@@ -81,6 +85,12 @@ static bool _mqtt_rx_line(const char* line) {
         _rxInProgress = false;
         return true;
     }
+    // +CIPEVENT: NETWORK CLOSED UNEXPECTEDLY, +PDP: DEACT: the network took the bearer away.
+    if (strncmp(line, "+CIPEVENT:", 10) == 0 || strncmp(line, "+PDP: DEACT", 11) == 0) {
+        if (!_bearerSuspect) netlog_add("bearer: %.44s", line);
+        _bearerSuspect = true;
+        return false;   // still an ordinary line for whoever is reading
+    }
     if (strstr(line, "CONNLOST") || strstr(line, "CONN_LOST")) {
         const char* comma = strrchr(line, ',');
         const int cause = comma ? atoi(comma + 1) : -1;
@@ -94,6 +104,7 @@ static bool _mqtt_rx_line(const char* line) {
                  cause == 1 ? "network" : cause == 2 ? "keepalive" : cause == 3 ? "broker closed" :
                  cause == 4 ? "heartbeat" : "?");
         _count_connlost();
+        if (cause == 1) _bearerSuspect = true;
         _drop_session(why);
         return true;
     }
@@ -530,6 +541,34 @@ static bool _sync_modem_clock() {
 // different shape than expected, gsm_modem_init() continues exactly as it
 // did before this change. Send the log after a real attempt so the exchange
 // can be corrected if the module's replies don't match what is parsed here.
+// fw 2.0.2: "+NETOPEN: 1" is no longer trusted on its own. After the network
+// drops the PDP context, or after an ESP restart that left the modem running,
+// the modem can keep reporting the bearer open while no packet gets through
+// (CMQTTCONNECT err 3 "sock connect fail" forever). When the bearer is
+// suspect it is closed and opened again, and an IP address is required.
+static bool _bearer_has_ip() {
+    _flush_rx();
+    DBGLN("[AT] >> AT+IPADDR");
+    gsm.print("AT+IPADDR\r\n");
+    char line[128];
+    bool ip = false;
+    const uint32_t deadline = millis() + 3000;
+    while (millis() < deadline) {
+        if (!_read_line(line, sizeof(line), 200)) continue;
+        if (strstr(line, "+IPADDR:") && !strstr(line, "0.0.0.0")) { ip = true; continue; }
+        if (strstr(line, "OK") || strstr(line, "ERROR")) break;
+    }
+    return ip;
+}
+
+static void _bearer_close() {
+    DBGLN("[GSM] Closing the data bearer (AT+NETCLOSE)");
+    _mqtt_teardown();                    // CMQTT runs on top of the bearer
+    int err = -1;
+    _at_cmd_two_stage("AT+NETCLOSE", "+NETCLOSE:", 10000, &err);
+    delay(1000);
+}
+
 static bool _bring_up_pdp() {
     char line[128];
 
@@ -537,29 +576,40 @@ static bool _bring_up_pdp() {
     _flush_rx();
     DBGLN("[AT] >> AT+NETOPEN?");
     gsm.print("AT+NETOPEN?\r\n");
+    bool alreadyUp = false;
     uint32_t deadline = millis() + AT_DEFAULT_TIMEOUT_MS;
     while (millis() < deadline) {
         if (!_read_line(line, sizeof(line), 200)) continue;
-        if (strstr(line, "+NETOPEN: 1")) { DBGLN("[GSM] Network bearer already open"); return true; }
+        if (strstr(line, "+NETOPEN: 1")) { alreadyUp = true; continue; }
         if (strstr(line, "OK") || strstr(line, "ERROR")) break;
+    }
+    if (alreadyUp) {
+        if (!_bearerSuspect && _bearer_has_ip()) { DBGLN("[GSM] Network bearer already open"); return true; }
+        netlog_add("bearer stale (%s): reopening", _bearerSuspect ? "after failure" : "no IP");
+        _bearer_close();
     }
 
     char cmd[96];
     snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", APN);
     _at_cmd(cmd, AT_DEFAULT_TIMEOUT_MS);   // non-fatal: a SIM-provisioned default APN may already be set
 
-    // AT+NETOPEN -> OK, or "+IP ERROR: Network is already opened" (also fine).
+    // AT+NETOPEN -> OK, then +NETOPEN: <err> (0 = opened).
+    // "+IP ERROR: Network is already opened" + ERROR is also fine.
     DBGLN("[AT] >> AT+NETOPEN");
+    _flush_rx();
     gsm.print("AT+NETOPEN\r\n");
     bool opened = false, alreadyOpen = false;
-    deadline = millis() + 20000;   // bearer bring-up can take several seconds
+    int netopenErr = -1;
+    deadline = millis() + 30000;   // bearer bring-up can take several seconds
     while (millis() < deadline) {
         if (!_read_line(line, sizeof(line), 200)) continue;
         if (strstr(line, "already opened")) { alreadyOpen = true; }
-        if (strstr(line, "OK")) { opened = true; break; }
+        if (strstr(line, "+NETOPEN:")) { netopenErr = atoi(strchr(line, ':') + 1); opened = netopenErr == 0; break; }
+        if (strcmp(line, "OK") == 0) { opened = true; }   // the result follows as +NETOPEN: <err>
         if (strstr(line, "ERROR")) break;
     }
     if (!opened && !alreadyOpen) {
+        netlog_add("netopen failed err=%d", netopenErr);
         DBGLN("[GSM] AT+NETOPEN failed -- trying AT+CNACT=1,1 as a fallback (different chip family)");
         _flush_rx();
         gsm.print("AT+CNACT=1,1\r\n");
@@ -573,19 +623,16 @@ static bool _bring_up_pdp() {
         return false;
     }
 
-    // Confirm with an IP, not just OK -- AT+IPADDR -> "+IPADDR: <ip>".
-    _flush_rx();
-    DBGLN("[AT] >> AT+IPADDR");
-    gsm.print("AT+IPADDR\r\n");
-    deadline = millis() + AT_DEFAULT_TIMEOUT_MS;
-    while (millis() < deadline) {
-        if (!_read_line(line, sizeof(line), 200)) continue;
-        if (strstr(line, "+IPADDR:") && !strstr(line, "0.0.0.0")) {
+    // Confirm with an IP, not just OK.
+    for (int i = 0; i < 5; ++i) {
+        if (_bearer_has_ip()) {
             DBGLN("[GSM] Network bearer open with an IP address");
+            _bearerSuspect = false;
             return true;
         }
-        if (strstr(line, "OK") || strstr(line, "ERROR")) break;
+        delay(1000);
     }
+    netlog_add("bearer open but no IP address");
     DBGLN("[GSM] NETOPEN reported OK but no IP yet -- proceeding anyway");
     return true;
 }
@@ -968,6 +1015,22 @@ static void _run_tls_diagnostics() {
     DBGLN("[DIAG] ==========================================================================");
 }
 
+// AT+CMQTTCONNECT? -> +CMQTTCONNECT: 0,"tcp://host:8883",60,1 when connected.
+static bool _cmqtt_reports_connected() {
+    _flush_rx();
+    DBGLN("[AT] >> AT+CMQTTCONNECT?");
+    gsm.print("AT+CMQTTCONNECT?\r\n");
+    char line[200];
+    bool up = false;
+    const uint32_t deadline = millis() + 3000;
+    while (millis() < deadline) {
+        if (!_read_line(line, sizeof(line), 200)) continue;
+        if (strstr(line, "+CMQTTCONNECT:") && strstr(line, "tcp://")) up = true;
+        if (strcmp(line, "OK") == 0 || strstr(line, "ERROR")) break;
+    }
+    return up;
+}
+
 bool at_mqtt_connect() {
     char cmdBuf[300];
     int  err = -1;
@@ -1043,13 +1106,23 @@ bool at_mqtt_connect() {
 
     _stage = "connect";
     DBGLN("[MQTT] Connecting to AWS IoT...");
-    if (!_at_cmd_two_stage(cmdBuf, "+CMQTTCONNECT:", AT_CONNECT_TIMEOUT_MS, &err)) {
-        DBGLN("[MQTT] CMQTTCONNECT no response");
-        netlog_add("connect: no CMQTTCONNECT result");
-        return false;
+    const uint32_t connectAt = millis();
+    if (!_at_cmd_two_stage(cmdBuf, "+CMQTTCONNECT:", AT_MQTT_CONNECT_WAIT_MS, &err)) {
+        // The result may simply be late. Ask before tearing a live session down.
+        if (_cmqtt_reports_connected()) {
+            netlog_add("connect: result late (%lums), session is up", (unsigned long)(millis() - connectAt));
+            err = 0;
+        } else {
+            DBGLN("[MQTT] CMQTTCONNECT no response");
+            netlog_add("connect: no result in %lus", (unsigned long)(AT_MQTT_CONNECT_WAIT_MS / 1000UL));
+            _lastConnErr = 17;   // report it as a timeout
+            _bearerSuspect = true;
+            return false;
+        }
     }
     if (err != 0) {
         _lastConnErr = err;
+        if (err != 30 && err != 31) _bearerSuspect = true;   // 30/31: TLS worked, broker said no
         DBGF("[MQTT] Connect failed err=%d (%s)\n", err, at_mqtt_err_string(err));
         netlog_add("connect err=%d (%s)", err, at_mqtt_err_string(err));
         // err 32/33/34 all mean "the TLS handshake never completed", which has
@@ -1088,6 +1161,9 @@ bool at_mqtt_connect() {
     }
 
     _stage = "connected";
+    _bearerSuspect = false;
+    if (millis() - connectAt > 15000)
+        netlog_add("connect slow: %lums", (unsigned long)(millis() - connectAt));
     DBGLN("[MQTT] Connected to AWS IoT");
     _tlsFailStreak = 0;
     _connected  = true;
@@ -1616,6 +1692,7 @@ bool at_modem_radio_cycle() {
     DBGLN("[NET] Recovery step 1: MQTT teardown + radio off/on");
     _mqtt_teardown();
     _connected = false;
+    _bearerSuspect = true;
     _at_cmd("AT+CFUN=0", 15000);   // detach and power the RF down
     delay(3000);
     const bool ok = _at_cmd("AT+CFUN=1", 15000);
@@ -1626,6 +1703,7 @@ bool at_modem_radio_cycle() {
 bool at_modem_reset() {
     DBGLN("[NET] Recovery step 2: modem reset (AT+CRESET)");
     _connected = false;
+    _bearerSuspect = true;
     if (!_at_cmd("AT+CRESET", 5000)) {
         DBGLN("[NET] CRESET not accepted - modem not answering AT");
         return false;
@@ -1641,4 +1719,80 @@ bool at_modem_reset() {
     }
     DBGLN("[NET] No RDY after CRESET (continuing)");
     return true;
+}
+
+// ── Layer probe (fw 2.0.2) ──────────────────────────────────────────
+
+// Plain HTTP to a well-known endpoint that answers 204 with no body. An
+// operator that has stopped the data plan usually answers instead with a
+// redirect (30x) or its own page (200); no answer at all means no TCP.
+static int _http_check() {
+    esp_task_wdt_reset();
+    _at_cmd("AT+HTTPTERM", 3000);                       // ERROR if not initialised: fine
+    if (!_at_cmd("AT+HTTPINIT", 5000)) return -1;
+    _at_cmd("AT+HTTPPARA=\"URL\",\"http://connectivitycheck.gstatic.com/generate_204\"", 5000);
+    int method = -1, status = -1, len = -1;
+    _flush_rx();
+    DBGLN("[AT] >> AT+HTTPACTION=0");
+    gsm.print("AT+HTTPACTION=0\r\n");
+    char line[128];
+    const uint32_t deadline = millis() + 30000;
+    while (millis() < deadline) {
+        if (!_read_line(line, sizeof(line), 200)) continue;
+        const char* p = strstr(line, "+HTTPACTION:");
+        if (p && sscanf(p + 12, " %d,%d,%d", &method, &status, &len) == 3) break;
+        if (strstr(line, "ERROR")) break;
+    }
+    _at_cmd("AT+HTTPTERM", 3000);
+    return status;
+}
+
+// +CPSI: LTE,Online,404-10,0x1A2B,12345678,123,EUTRAN-BAND40,38950,5,5,-11,-95,-65,12
+//        0   1      2      3      4        5   6             7     8 9 10  11  12  13
+static void _cell_info(char* out, size_t outLen) {
+    snprintf(out, outLen, "cell?");
+    _flush_rx();
+    DBGLN("[AT] >> AT+CPSI?");
+    gsm.print("AT+CPSI?\r\n");
+    char line[200];
+    const uint32_t deadline = millis() + 3000;
+    while (millis() < deadline) {
+        if (!_read_line(line, sizeof(line), 200)) continue;
+        char* p = strstr(line, "+CPSI:");
+        if (p) {
+            p += 6;
+            while (*p == ' ') ++p;
+            const char* f[16] = {};
+            int n = 0;
+            f[n++] = p;
+            for (char* c = p; *c && n < 16; ++c) {
+                if (*c == ',') { *c = '\0'; f[n++] = c + 1; }
+            }
+            if (strncmp(f[0], "LTE", 3) == 0 && n >= 14) {
+                const char* band = strstr(f[6], "BAND") ? strstr(f[6], "BAND") + 4 : f[6];
+                snprintf(out, outLen, "B%.4s q%.5s p%.5s s%.5s", band, f[10], f[11], f[13]);
+            } else {
+                snprintf(out, outLen, "%.10s %.10s", f[0], n > 1 ? f[1] : "");
+            }
+            continue;   // wait for OK
+        }
+        if (strcmp(line, "OK") == 0 || strstr(line, "ERROR")) break;
+    }
+}
+
+void at_net_probe(char* out, size_t outLen) {
+    const uint32_t t0 = millis();
+    const bool ip = _bearer_has_ip();
+    char addr[48] = "";
+    const bool dns = _modem_resolve(MQTT_BROKER_HOST, addr, sizeof(addr));
+    const int http = _http_check();
+    char cell[32];
+    _cell_info(cell, sizeof(cell));
+    snprintf(out, outLen, "ip%d dns%d http%d %s", ip ? 1 : 0, dns ? 1 : 0, http, cell);
+    DBGF("[NET] probe (%lu ms): %s  (broker %s -> %s)\n", (unsigned long)(millis() - t0), out,
+         MQTT_BROKER_HOST, dns ? addr : "no answer");
+    portENTER_CRITICAL(&_statsMux);
+    strncpy(_stats.last_probe, out, sizeof(_stats.last_probe) - 1);
+    _stats.last_probe[sizeof(_stats.last_probe) - 1] = '\0';
+    portEXIT_CRITICAL(&_statsMux);
 }

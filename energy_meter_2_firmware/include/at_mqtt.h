@@ -63,6 +63,17 @@ bool at_modem_radio_cycle();
 // Recovery ladder step 2: AT+CRESET and wait for RDY. False if the modem does not answer AT.
 bool at_modem_reset();
 
+// fw 2.0.2: layer-by-layer test after a failed connect (MQTT must be down).
+// Writes "ip<0|1> dns<0|1> http<status> <cell>", e.g.
+//   "ip1 dns1 http204 B40 q-11 p-95 s12"
+//   ip    the modem has an IP address on its data bearer
+//   dns   iot.energywise.tech resolves
+//   http  plain GET http://connectivitycheck.gstatic.com/generate_204:
+//         204 = open internet; 200/30x = operator portal (data plan); 7xx/-1 = no TCP
+//   cell  LTE band, RSRQ (q), RSRP (p), SINR (s) from AT+CPSI?, or the mode
+// Takes up to ~50 s.
+void at_net_probe(char* out, size_t outLen);
+
 // Boot-loop safe mode: no one-shot TLS diagnosis, no cert re-upload loop.
 void at_mqtt_set_safe_mode(bool on);
 
@@ -76,5 +87,6 @@ struct AtMqttStats {
     uint32_t last_pub_ms;
     uint32_t max_pub_ms;
     char     last_drop[40];     // why the session was last dropped
+    char     last_probe[48];    // last at_net_probe() result (fw 2.0.2)
 };
 AtMqttStats at_mqtt_stats();

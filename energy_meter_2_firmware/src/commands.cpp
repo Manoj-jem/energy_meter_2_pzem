@@ -127,6 +127,7 @@ void execute(const char* json, const RuntimeStatus& status, char* out, size_t ou
         mq["last_pub_ms"] = ms.last_pub_ms;
         mq["max_pub_ms"] = ms.max_pub_ms;
         mq["last_drop"] = ms.last_drop;
+        mq["last_probe"] = ms.last_probe;
         mq["log_lines"] = netlog_count();
         JsonObject prev = response["previous_boot"].to<JsonObject>();
         prev["restart_cause"] = restart_cause_name(boot.prev_cause);

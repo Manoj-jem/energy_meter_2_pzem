@@ -6,11 +6,11 @@ file stream for it and prints (or, with --send, publishes) the {"cmd":"ota",...}
 command for the meter's <thing>/cmd topic. See FLASHING.md, "Remote update".
 Same mechanism, bucket and IAM role as gateway_firmware/tools/ota_release.py.
 
-    cd energy_meter_2_firmware && pio run -e energy-meter-14 && cd ..
-    python tools/ota_release.py --env energy-meter-14 --bucket energywise-gateway-firmware          # dry run
-    python tools/ota_release.py --env energy-meter-14 --bucket energywise-gateway-firmware --send   # publishes it
+    cd energy_meter_2_firmware && pio run -e energy-meter-6 && cd ..
+    python tools/ota_release.py --env energy-meter-6 --bucket energywise-gateway-firmware          # dry run
+    python tools/ota_release.py --env energy-meter-6 --bucket energywise-gateway-firmware --send   # publishes it
 
-Only firmware 2.x meters can be updated this way (energy-meter-14, energy-meter-26 onwards);
+Only firmware 2.x meters can be updated this way (energy-meter-6, energy-meter-14, energy-meter-26 onwards);
 meters on 1.0.0 have no OTA.
 
 The meter receives the image over its existing MQTT connection to
@@ -82,7 +82,7 @@ def ensure_stream(stream_id, bucket, key, role):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--env", required=True, help="PlatformIO env = AWS thing name, e.g. energy-meter-14")
+    parser.add_argument("--env", required=True, help="PlatformIO env = AWS thing name, e.g. energy-meter-6")
     parser.add_argument("--bucket", help="private S3 bucket for firmware images")
     parser.add_argument("--role", default=DEFAULT_ROLE, help="IAM role (name or ARN) AWS IoT uses to read the bucket")
     parser.add_argument("--url", nargs="?", const="presign",

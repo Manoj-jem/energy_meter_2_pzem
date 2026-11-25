@@ -5,7 +5,7 @@
 // Same mechanism as gateway_firmware (in use there since 1.1.2); only the
 // identity marker ("EMPZ-ID:<thing>") and the abort condition differ.
 //
-//   {"cmd":"ota","stream":"energy-meter-14_2_1_0_a4ef05d9","stream_ver":1,"size":401234,
+//   {"cmd":"ota","stream":"energy-meter-6_2_1_0_a4ef05d9","stream_ver":1,"size":401234,
 //    "sha256":"<64 hex>","version":"2.0.1","force":false,"req":"abc"}
 //   ("url":"http://..." instead of "stream" downloads over HTTP; see below)
 //

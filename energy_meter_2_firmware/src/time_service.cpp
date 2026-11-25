@@ -19,6 +19,9 @@ bool parseIso8601(const char* input, time_t& epoch) {
                &year, &month, &day, &hour, &minute, &second, &sign, &offsetHour, &offsetMinute) != 9) {
         return false;
     }
+    // An unset A7670C clock reads "70/01/01", i.e. 2070 once the century is
+    // added: never take that (or anything before 2020) as real time.
+    if (year < 2020 || year >= 2070) return false;
     tm value{};
     value.tm_year = year - 1900;
     value.tm_mon = month - 1;

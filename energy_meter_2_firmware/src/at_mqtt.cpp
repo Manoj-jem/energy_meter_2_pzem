@@ -23,6 +23,9 @@ static int _lastConnErr = 0;
 // True at boot (an ESP restart leaves the modem's old bearer up), after any
 // failed connect, a network CONNLOST, a bearer URC or a recovery step.
 static bool _bearerSuspect = true;
+// fw 2.1.1: consecutive connects where CMQTTSTART and CMQTTACCQ both answered ERROR.
+static uint8_t  _cmqttStuckStreak = 0;
+static uint32_t _cmqttStuckResetMs = 0;
 static bool _safeMode = false;
 static const unsigned long PING_INTERVAL_MS = 45000UL;
 static void _drop_session(const char* why);   // publish section
@@ -1088,17 +1091,39 @@ bool at_mqtt_connect() {
     if (!_at_cmd(cmdBuf, AT_DEFAULT_TIMEOUT_MS)) { DBGLN("[MQTT] clientkey failed");  return false; }
 
     _stage = "mqtt_start";
+    bool startErrored = false;
     DBGLN("[MQTT] Starting CMQTT service...");
     if (_at_cmd_two_stage("AT+CMQTTSTART", "+CMQTTSTART:", AT_DEFAULT_TIMEOUT_MS * 2, &err)) {
         if (err != 0) { DBGF("[MQTT] CMQTTSTART failed err=%d\n", err); netlog_add("cmqttstart err=%d", err); return false; }
         DBGLN("[MQTT] CMQTT service started");
     } else {
         DBGLN("[MQTT] CMQTTSTART ERROR — proceeding");
+        startErrored = true;
     }
     delay(300);
 
     snprintf(cmdBuf, sizeof(cmdBuf), "AT+CMQTTACCQ=0,\"%s\",1", MQTT_CLIENT_ID);
-    if (!_at_cmd(cmdBuf, AT_DEFAULT_TIMEOUT_MS)) { DBGLN("[MQTT] CMQTTACCQ failed"); return false; }
+    if (!_at_cmd(cmdBuf, AT_DEFAULT_TIMEOUT_MS)) {
+        DBGLN("[MQTT] CMQTTACCQ failed");
+        // fw 2.1.1: CMQTTSTOP, CMQTTSTART and CMQTTACCQ all answering ERROR is
+        // the modem's MQTT service stuck (seen on energy-meter-14, A7670C
+        // V11.0.01, fw 1.0.0, 2026-11-26). It never clears by itself, and fw
+        // 1.0.0 retried it forever. Only a modem reset clears it, so do that
+        // now instead of waiting for the 20-minute ladder step.
+        if (startErrored) {
+            ++_cmqttStuckStreak;
+            netlog_add("cmqtt stuck: start+accq ERROR x%u", (unsigned)_cmqttStuckStreak);
+            if (_cmqttStuckStreak >= CMQTT_STUCK_RESET_AFTER &&
+                (!_cmqttStuckResetMs || millis() - _cmqttStuckResetMs >= CMQTT_STUCK_RESET_GAP_MS)) {
+                netlog_add("cmqtt stuck: modem reset (CRESET)");
+                _cmqttStuckResetMs = millis() | 1;
+                _cmqttStuckStreak = 0;
+                at_modem_reset();
+            }
+        }
+        return false;
+    }
+    _cmqttStuckStreak = 0;
 
     if (!_at_cmd("AT+CMQTTSSLCFG=0,0", AT_DEFAULT_TIMEOUT_MS)) { DBGLN("[MQTT] CMQTTSSLCFG failed"); return false; }
 

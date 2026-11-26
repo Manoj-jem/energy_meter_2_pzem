@@ -48,7 +48,7 @@
 #define DEVICE_ID           AWS_THING_NAME
 // Bump with EVERY firmware change: a meter refuses an OTA image whose version
 // equals the one it runs (see ota.h). 2.0.0 = first OTA-capable meter firmware.
-#define FIRMWARE_VERSION    "2.1.0"
+#define FIRMWARE_VERSION    "2.1.1"
 
 // Payload schema. 2 = fw 1.0.x (installed meters, never updated), 3 = fw 2.x.
 // The backend dispatches on this field; v3 only ADDS fields to v2.
@@ -159,6 +159,10 @@
 // fw 2.0.2: after a failed connect, test the layers below MQTT (IP, DNS, plain
 // HTTP, serving cell) at most this often; the first failure of an outage always.
 #define NET_PROBE_EVERY_MS      (10UL * 60UL * 1000UL)
+// fw 2.1.1: modem MQTT service stuck (CMQTTSTART and CMQTTACCQ both ERROR):
+// reset the modem after this many such attempts in a row, at most once per gap.
+#define CMQTT_STUCK_RESET_AFTER 2
+#define CMQTT_STUCK_RESET_GAP_MS (10UL * 60UL * 1000UL)
 #define AT_PUB_TIMEOUT_MS       10000   // cert writes, HTTP reads
 
 // Publish (fw 2.0.1). The modem is told to give up on a QoS 1 PUBACK after

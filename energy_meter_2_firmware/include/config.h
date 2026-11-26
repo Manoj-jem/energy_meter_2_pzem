@@ -48,7 +48,7 @@
 #define DEVICE_ID           AWS_THING_NAME
 // Bump with EVERY firmware change: a meter refuses an OTA image whose version
 // equals the one it runs (see ota.h). 2.0.0 = first OTA-capable meter firmware.
-#define FIRMWARE_VERSION    "2.1.3"
+#define FIRMWARE_VERSION    "2.1.4"
 
 // Payload schema. 2 = fw 1.0.x (installed meters, never updated), 3 = fw 2.x.
 // The backend dispatches on this field; v3 only ADDS fields to v2.

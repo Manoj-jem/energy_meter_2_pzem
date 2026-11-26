@@ -365,9 +365,35 @@ void scanAliveLocked() {
 
 }  // namespace
 
+// fw 2.1.4: wake and reset the chip before reading its ID. The ESP can restart
+// (watchdog, OTA, USB flashing) while the NOR stays powered, and a chip left
+// in deep power-down, continuous-read mode or a half-finished command ignores
+// READ ID (0x9F) until it gets these. All are harmless on a chip that is idle.
+static void flashWake() {
+    flashSPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    selectFlash();                       // exit continuous-read mode: 16 clocks with IO high
+    flashSPI.transfer(0xFF);
+    flashSPI.transfer(0xFF);
+    deselectFlash();
+    delayMicroseconds(5);
+    selectFlash(); flashSPI.transfer(0xAB); deselectFlash();   // release from deep power-down
+    delayMicroseconds(50);
+    selectFlash(); flashSPI.transfer(0x66); deselectFlash();   // enable reset
+    delayMicroseconds(5);
+    selectFlash(); flashSPI.transfer(0x99); deselectFlash();   // reset
+    flashSPI.endTransaction();
+    delay(1);                            // tRST is at most ~30 us; be generous
+}
+
 bool storage_init() {
     pinMode(FLASH_CS_PIN, OUTPUT);
     deselectFlash();
+    // fw 2.1.4: with CS high the chip leaves MISO floating, so with the internal
+    // pull-up it must read high. Low means the line is held down: a short to
+    // GND, or a chip with no supply clamping it through its input diodes.
+    pinMode(FLASH_MISO_PIN, INPUT_PULLUP);
+    delay(2);
+    const bool misoHigh = digitalRead(FLASH_MISO_PIN) == HIGH;
     flashSPI.begin(FLASH_SCK_PIN, FLASH_MISO_PIN, FLASH_MOSI_PIN, FLASH_CS_PIN);
     if (flashMutex == nullptr) flashMutex = xSemaphoreCreateMutex();
     if (flashMutex == nullptr) {
@@ -380,14 +406,15 @@ bool storage_init() {
     bool idOk = false;
     for (uint8_t attempt = 1; attempt <= INIT_ATTEMPTS && !idOk; ++attempt) {
         health.init_attempts = attempt;
+        flashWake();
         readJedec(health.jedec);
         const uint8_t cap = health.jedec[2];
         idOk = health.jedec[0] != 0x00 && health.jedec[0] != 0xFF && cap >= 0x15 && cap < 0x20;
         if (!idOk) delay(50 * attempt);
     }
     if (!idOk) {
-        snprintf(health.fail_step, sizeof(health.fail_step), "jedec %02X %02X %02X", health.jedec[0],
-                 health.jedec[1], health.jedec[2]);
+        snprintf(health.fail_step, sizeof(health.fail_step), "jedec %02X %02X %02X %s", health.jedec[0],
+                 health.jedec[1], health.jedec[2], misoHigh ? "miso-ok" : "miso-low");
         DBGF("[STORAGE] No usable SPI NOR (%s)\n", health.fail_step);
         return false;
     }

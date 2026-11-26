@@ -69,7 +69,7 @@ size_t payload_build(const TelemetryRecord& record,
     snprintf(signal, sizeof(signal),
              "{\"quality\":\"%s\",\"csq\":%d,\"rssi_dbm\":%s,\"rat\":\"%s\",\"band\":%u,"
              "\"rsrp_dbm\":%s,\"rsrq_db\":%s,\"sinr_db\":%s}",
-             signal_quality(h.rssi_raw, h.rat, h.rsrp_dbm), (int)h.rssi_raw, rssiDbm,
+             signal_quality(h.rssi_raw, h.rat, h.rsrp_dbm, h.sinr_db), (int)h.rssi_raw, rssiDbm,
              cell_rat_name(h.rat), (unsigned)h.band, rsrp, rsrq, sinr);
 
     int written = snprintf(outBuf, outBufLen,

@@ -98,7 +98,7 @@ void execute(const char* json, const RuntimeStatus& status, char* out, size_t ou
         {
             const CellSignal c = at_last_cell_signal();
             JsonObject sig = response["signal"].to<JsonObject>();
-            sig["quality"] = signal_quality(status.rssiRaw, c.rat, c.rsrp_dbm);
+            sig["quality"] = signal_quality(status.rssiRaw, c.rat, c.rsrp_dbm, c.sinr_db);
             sig["csq"] = status.rssiRaw;
             if (status.rssiRaw >= 0 && status.rssiRaw <= 31) sig["rssi_dbm"] = -113 + 2 * status.rssiRaw;
             sig["rat"] = cell_rat_name(c.rat);
@@ -127,6 +127,9 @@ void execute(const char* json, const RuntimeStatus& status, char* out, size_t ou
         flash["dropped"] = stats.dropped_records;
         reply(response, req, cmd, true, nullptr, out, outLen);
     } else if (strcmp(cmd, "diag") == 0) {
+        response["fw"] = FIRMWARE_VERSION;
+        response["uptime_s"] = diag_uptime_s();
+        response["reset_reason"] = reset_reason_name(boot.reset_reason);
         JsonObject counters = response["counters"].to<JsonObject>();
         counters["boot_count"] = boot.boot_count;
         counters["fast_boots"] = boot.fast_boots;

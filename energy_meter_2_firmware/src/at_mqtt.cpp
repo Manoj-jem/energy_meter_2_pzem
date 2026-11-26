@@ -23,6 +23,9 @@ static int _lastConnErr = 0;
 // True at boot (an ESP restart leaves the modem's old bearer up), after any
 // failed connect, a network CONNLOST, a bearer URC or a recovery step.
 static bool _bearerSuspect = true;
+// fw 2.1.1: consecutive connects where CMQTTSTART and CMQTTACCQ both answered ERROR.
+static uint8_t  _cmqttStuckStreak = 0;
+static uint32_t _cmqttStuckResetMs = 0;
 static bool _safeMode = false;
 static const unsigned long PING_INTERVAL_MS = 45000UL;
 static void _drop_session(const char* why);   // publish section
@@ -1088,17 +1091,39 @@ bool at_mqtt_connect() {
     if (!_at_cmd(cmdBuf, AT_DEFAULT_TIMEOUT_MS)) { DBGLN("[MQTT] clientkey failed");  return false; }
 
     _stage = "mqtt_start";
+    bool startErrored = false;
     DBGLN("[MQTT] Starting CMQTT service...");
     if (_at_cmd_two_stage("AT+CMQTTSTART", "+CMQTTSTART:", AT_DEFAULT_TIMEOUT_MS * 2, &err)) {
         if (err != 0) { DBGF("[MQTT] CMQTTSTART failed err=%d\n", err); netlog_add("cmqttstart err=%d", err); return false; }
         DBGLN("[MQTT] CMQTT service started");
     } else {
         DBGLN("[MQTT] CMQTTSTART ERROR — proceeding");
+        startErrored = true;
     }
     delay(300);
 
     snprintf(cmdBuf, sizeof(cmdBuf), "AT+CMQTTACCQ=0,\"%s\",1", MQTT_CLIENT_ID);
-    if (!_at_cmd(cmdBuf, AT_DEFAULT_TIMEOUT_MS)) { DBGLN("[MQTT] CMQTTACCQ failed"); return false; }
+    if (!_at_cmd(cmdBuf, AT_DEFAULT_TIMEOUT_MS)) {
+        DBGLN("[MQTT] CMQTTACCQ failed");
+        // fw 2.1.1: CMQTTSTOP, CMQTTSTART and CMQTTACCQ all answering ERROR is
+        // the modem's MQTT service stuck (seen on energy-meter-14, A7670C
+        // V11.0.01, fw 1.0.0, 2026-11-26). It never clears by itself, and fw
+        // 1.0.0 retried it forever. Only a modem reset clears it, so do that
+        // now instead of waiting for the 20-minute ladder step.
+        if (startErrored) {
+            ++_cmqttStuckStreak;
+            netlog_add("cmqtt stuck: start+accq ERROR x%u", (unsigned)_cmqttStuckStreak);
+            if (_cmqttStuckStreak >= CMQTT_STUCK_RESET_AFTER &&
+                (!_cmqttStuckResetMs || millis() - _cmqttStuckResetMs >= CMQTT_STUCK_RESET_GAP_MS)) {
+                netlog_add("cmqtt stuck: modem reset (CRESET)");
+                _cmqttStuckResetMs = millis() | 1;
+                _cmqttStuckStreak = 0;
+                at_modem_reset();
+            }
+        }
+        return false;
+    }
+    _cmqttStuckStreak = 0;
 
     if (!_at_cmd("AT+CMQTTSSLCFG=0,0", AT_DEFAULT_TIMEOUT_MS)) { DBGLN("[MQTT] CMQTTSSLCFG failed"); return false; }
 
@@ -1711,16 +1736,25 @@ bool at_modem_reset() {
         DBGLN("[NET] CRESET not accepted - modem not answering AT");
         return false;
     }
-    // The module reboots: it prints RDY (and later PB DONE) when ready.
+    // The module reboots. SIM7600 prints RDY / PB DONE; the A7670C prints
+    // *ATREADY: 1, +CPIN: READY, SMS DONE and then +CGEV: EPS PDN ACT 1 once
+    // its data bearer is up. Wait for that last one, or PB DONE / RDY.
     char line[128];
-    const uint32_t deadline = millis() + 30000;
+    const uint32_t t0 = millis();
+    const uint32_t deadline = t0 + 30000;
+    bool booted = false;
     while (millis() < deadline) {
-        if (_read_line(line, sizeof(line), 500) && (strstr(line, "RDY") || strstr(line, "PB DONE"))) {
-            DBGLN("[NET] Modem back after reset");
+        if (!_read_line(line, sizeof(line), 500)) continue;
+        if (strstr(line, "*ATREADY") || strstr(line, "RDY")) booted = true;
+        if (strstr(line, "PDN ACT") || strstr(line, "PB DONE")) {
+            DBGF("[NET] Modem back after reset (%lu ms)\n", (unsigned long)(millis() - t0));
+            netlog_add("creset: modem back in %lus", (unsigned long)((millis() - t0) / 1000UL));
+            delay(2000);
             return true;
         }
     }
-    DBGLN("[NET] No RDY after CRESET (continuing)");
+    DBGLN("[NET] Modem not fully back 30 s after CRESET (continuing)");
+    netlog_add("creset: %s after 30s", booted ? "booted, no PDN" : "no boot message");
     return true;
 }
 
@@ -1785,8 +1819,18 @@ bool at_cell_signal(CellSignal& out) {
                 if (n >= 14) {
                     const char* b = strstr(f[6], "BAND");
                     out.band = (uint8_t)atoi(b ? b + 4 : f[6]);
-                    out.rsrq_db = (int8_t)_scale(atoi(f[10]), 40);
-                    out.rsrp_dbm = (int16_t)_scale(atoi(f[11]), 200);
+                    const int rq = atoi(f[10]);
+                    const int rp = atoi(f[11]);
+                    if (rp >= 0 && rp <= 97) {
+                        // A7670C V11.0.01 reports 3GPP TS 36.133 indices, not dB:
+                        // "...,5,5,3,38,45,-7" = RSRQ_03, RSRP_38. RSRP_n ~ n-141 dBm,
+                        // RSRQ_n ~ -20 + n/2 dB. A real RSRP is never positive.
+                        out.rsrp_dbm = (int16_t)(rp - 141);
+                        out.rsrq_db = (int8_t)(rq >= 0 && rq <= 34 ? -20 + rq / 2 : _scale(rq, 40));
+                    } else {
+                        out.rsrq_db = (int8_t)_scale(rq, 40);
+                        out.rsrp_dbm = (int16_t)_scale(rp, 200);
+                    }
                     const int snr = _scale(atoi(f[13]), 60);
                     out.sinr_db = (int8_t)(snr < -127 ? -127 : snr > 127 ? 127 : snr);
                 }
@@ -1821,10 +1865,15 @@ const char* cell_rat_name(uint8_t rat) {
     return rat <= 4 ? names[rat] : "unknown";
 }
 
-const char* signal_quality(int csq, uint8_t rat, int16_t rsrp_dbm) {
+const char* signal_quality(int csq, uint8_t rat, int16_t rsrp_dbm, int8_t sinr_db) {
     if (rat == 4) return "none";
     if (rat == 1 && rsrp_dbm < 0) {
-        return rsrp_dbm >= -90 ? "excellent" : rsrp_dbm >= -105 ? "good" : rsrp_dbm >= -115 ? "fair" : "poor";
+        // Worse of power (RSRP) and cleanliness (SINR): a strong but noisy cell
+        // (meter 14: RSRP -107, SINR -5) still loses packets.
+        static const char* const names[] = {"poor", "fair", "good", "excellent"};
+        const int p = rsrp_dbm >= -90 ? 3 : rsrp_dbm >= -105 ? 2 : rsrp_dbm >= -115 ? 1 : 0;
+        const int s = sinr_db == -128 ? 3 : sinr_db >= 13 ? 3 : sinr_db >= 5 ? 2 : sinr_db >= 0 ? 1 : 0;
+        return names[p < s ? p : s];
     }
     if (csq < 0 || csq == 99) return "unknown";
     return csq >= 20 ? "excellent" : csq >= 15 ? "good" : csq >= 10 ? "fair" : "poor";

@@ -1865,10 +1865,15 @@ const char* cell_rat_name(uint8_t rat) {
     return rat <= 4 ? names[rat] : "unknown";
 }
 
-const char* signal_quality(int csq, uint8_t rat, int16_t rsrp_dbm) {
+const char* signal_quality(int csq, uint8_t rat, int16_t rsrp_dbm, int8_t sinr_db) {
     if (rat == 4) return "none";
     if (rat == 1 && rsrp_dbm < 0) {
-        return rsrp_dbm >= -90 ? "excellent" : rsrp_dbm >= -105 ? "good" : rsrp_dbm >= -115 ? "fair" : "poor";
+        // Worse of power (RSRP) and cleanliness (SINR): a strong but noisy cell
+        // (meter 14: RSRP -107, SINR -5) still loses packets.
+        static const char* const names[] = {"poor", "fair", "good", "excellent"};
+        const int p = rsrp_dbm >= -90 ? 3 : rsrp_dbm >= -105 ? 2 : rsrp_dbm >= -115 ? 1 : 0;
+        const int s = sinr_db == -128 ? 3 : sinr_db >= 13 ? 3 : sinr_db >= 5 ? 2 : sinr_db >= 0 ? 1 : 0;
+        return names[p < s ? p : s];
     }
     if (csq < 0 || csq == 99) return "unknown";
     return csq >= 20 ? "excellent" : csq >= 15 ? "good" : csq >= 10 ? "fair" : "poor";

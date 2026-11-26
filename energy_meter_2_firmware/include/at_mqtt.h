@@ -86,8 +86,9 @@ struct CellSignal {
 bool at_cell_signal(CellSignal& out);      // queries the modem (network task only)
 CellSignal at_last_cell_signal();          // last result, any task
 const char* cell_rat_name(uint8_t rat);
-// "excellent" / "good" / "fair" / "poor" / "unknown": RSRP on LTE, CSQ otherwise.
-const char* signal_quality(int csq, uint8_t rat, int16_t rsrp_dbm);
+// "excellent" / "good" / "fair" / "poor" / "unknown": on LTE the worse of RSRP
+// (>= -90 / -105 / -115 dBm) and SINR (>= 13 / 5 / 0 dB); CSQ otherwise.
+const char* signal_quality(int csq, uint8_t rat, int16_t rsrp_dbm, int8_t sinr_db);
 
 // Read on every modem init. Empty strings until then. msisdn is often empty:
 // most SIMs do not store their own number (AT+CNUM); iccid is printed on the SIM card.

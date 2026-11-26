@@ -1736,16 +1736,25 @@ bool at_modem_reset() {
         DBGLN("[NET] CRESET not accepted - modem not answering AT");
         return false;
     }
-    // The module reboots: it prints RDY (and later PB DONE) when ready.
+    // The module reboots. SIM7600 prints RDY / PB DONE; the A7670C prints
+    // *ATREADY: 1, +CPIN: READY, SMS DONE and then +CGEV: EPS PDN ACT 1 once
+    // its data bearer is up. Wait for that last one, or PB DONE / RDY.
     char line[128];
-    const uint32_t deadline = millis() + 30000;
+    const uint32_t t0 = millis();
+    const uint32_t deadline = t0 + 30000;
+    bool booted = false;
     while (millis() < deadline) {
-        if (_read_line(line, sizeof(line), 500) && (strstr(line, "RDY") || strstr(line, "PB DONE"))) {
-            DBGLN("[NET] Modem back after reset");
+        if (!_read_line(line, sizeof(line), 500)) continue;
+        if (strstr(line, "*ATREADY") || strstr(line, "RDY")) booted = true;
+        if (strstr(line, "PDN ACT") || strstr(line, "PB DONE")) {
+            DBGF("[NET] Modem back after reset (%lu ms)\n", (unsigned long)(millis() - t0));
+            netlog_add("creset: modem back in %lus", (unsigned long)((millis() - t0) / 1000UL));
+            delay(2000);
             return true;
         }
     }
-    DBGLN("[NET] No RDY after CRESET (continuing)");
+    DBGLN("[NET] Modem not fully back 30 s after CRESET (continuing)");
+    netlog_add("creset: %s after 30s", booted ? "booted, no PDN" : "no boot message");
     return true;
 }
 
@@ -1810,8 +1819,18 @@ bool at_cell_signal(CellSignal& out) {
                 if (n >= 14) {
                     const char* b = strstr(f[6], "BAND");
                     out.band = (uint8_t)atoi(b ? b + 4 : f[6]);
-                    out.rsrq_db = (int8_t)_scale(atoi(f[10]), 40);
-                    out.rsrp_dbm = (int16_t)_scale(atoi(f[11]), 200);
+                    const int rq = atoi(f[10]);
+                    const int rp = atoi(f[11]);
+                    if (rp >= 0 && rp <= 97) {
+                        // A7670C V11.0.01 reports 3GPP TS 36.133 indices, not dB:
+                        // "...,5,5,3,38,45,-7" = RSRQ_03, RSRP_38. RSRP_n ~ n-141 dBm,
+                        // RSRQ_n ~ -20 + n/2 dB. A real RSRP is never positive.
+                        out.rsrp_dbm = (int16_t)(rp - 141);
+                        out.rsrq_db = (int8_t)(rq >= 0 && rq <= 34 ? -20 + rq / 2 : _scale(rq, 40));
+                    } else {
+                        out.rsrq_db = (int8_t)_scale(rq, 40);
+                        out.rsrp_dbm = (int16_t)_scale(rp, 200);
+                    }
                     const int snr = _scale(atoi(f[13]), 60);
                     out.sinr_db = (int8_t)(snr < -127 ? -127 : snr > 127 ? 127 : snr);
                 }

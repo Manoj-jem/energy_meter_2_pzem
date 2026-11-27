@@ -197,7 +197,7 @@ Re-flash the main firmware afterwards — this sketch does nothing else.
 
 ## 8. Firmware 2.x: remote update (OTA) and diagnostics
 
-From firmware **2.0.0** (branches `Firmware-26`, `Firmware-14` and `Firmware-6`, and every new meter
+From firmware **2.0.0** (branches `Firmware-26`, `Firmware-14`, `Firmware-6` and `Firmware-27` to `Firmware-35`, and every new meter
 after it) a meter can be updated through its SIM, without a site visit. Meters on 1.0.0 have
 no OTA: they need **one** USB flash with a 2.x build first. Installed 1.0.0 meters are left as
 they are; the backend accepts both (`schema_version` 2 and 3).
@@ -218,19 +218,19 @@ that certificate already carries `gateway-ota-stream-policy`
 1. Bump `FIRMWARE_VERSION` in `energy_meter_2_firmware/include/config.h`. The meter refuses the
    version it already runs (unless `--force`).
 2. `python energy_meter_2_firmware/tools/run_host_tests.py` and
-   `cd energy_meter_2_firmware && pio run -e energy-meter-6`
+   `cd energy_meter_2_firmware && pio run -e energy-meter-31`
 3. Dry run (uploads to S3 and creates the stream, sends nothing):
    ```powershell
    $env:AWS_PROFILE = "em-481665103941"
-   python tools/ota_release.py --env energy-meter-6 --bucket energywise-gateway-firmware
+   python tools/ota_release.py --env energy-meter-31 --bucket energywise-gateway-firmware
    ```
-4. Send: the same with `--send`, or publish the printed JSON to `energy-meter-6/cmd`.
-5. Watch `energy-meter-6/cmd/ack`: `accepted, downloading` -> `progress` every 64 KB ->
+4. Send: the same with `--send`, or publish the printed JSON to `energy-meter-31/cmd`.
+5. Watch `energy-meter-31/cmd/ack`: `accepted, downloading` -> `progress` every 64 KB ->
    (restart) -> `running new firmware`. About 7-10 minutes for 0.4 MB.
 
 Telemetry is not lost during the download: it goes to the flash queue and is replayed after.
 The image is accepted only if size and SHA-256 match and it carries this meter's identity marker
-(`EMPZ-ID:energy-meter-6`): an image for another meter, or a gateway image, is refused.
+(`EMPZ-ID:energy-meter-31`): an image for another meter, or a gateway image, is refused.
 
 **Trial and rollback.** The new image must reach AWS within 15 minutes, at most 3 boots;
 otherwise the previous image boots again and reports `"error":"rolled back from <version>"`.
@@ -245,7 +245,7 @@ An update does not start while more than 1000 records wait in the flash queue (d
 | `image is not built for this meter` | wrong branch / env |
 | `flash backlog too large` | the meter is still replaying offline data: retry later |
 
-### Commands (`energy-meter-6/cmd`, replies on `/cmd/ack`; also as a JSON line on USB serial)
+### Commands (`energy-meter-31/cmd`, replies on `/cmd/ack`; also as a JSON line on USB serial)
 
 | Command | Reply |
 |---|---|

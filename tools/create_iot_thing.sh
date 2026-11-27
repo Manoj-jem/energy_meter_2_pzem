@@ -23,7 +23,9 @@ CERT_DIR="$(cd "$(dirname "$0")/.." && pwd)/certs/energy-meter-002"
 [ -f "$CERT_DIR/device.cert.pem" ] || { echo "missing $CERT_DIR/device.cert.pem"; exit 1; }
 
 # An AWS certificate ID is the SHA-256 of the certificate's DER encoding.
-CERT_ID="$(python - "$CERT_DIR/device.cert.pem" <<'PY'
+CERT_FILE="$CERT_DIR/device.cert.pem"
+command -v cygpath >/dev/null 2>&1 && CERT_FILE="$(cygpath -w "$CERT_FILE")"   # Git Bash on Windows
+CERT_ID="$(python - "$CERT_FILE" <<'PY'
 import base64, hashlib, re, sys
 pem = open(sys.argv[1]).read()
 der = base64.b64decode(re.search(r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----", pem, re.S).group(1))

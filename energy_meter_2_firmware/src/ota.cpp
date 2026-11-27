@@ -16,7 +16,7 @@
 
 // Every image carries its meter's marker; ota_run() refuses an image without
 // this meter's. The terminating NUL is part of the match, so energy-meter-2
-// never accepts an image for energy-meter-6. The prefix differs from the
+// never accepts an image for energy-meter-30. The prefix differs from the
 // gateways' "DGGW-ID:", so a gateway image can never land on a meter either.
 // Referenced below, so the linker keeps it.
 extern const char OTA_IDENTITY[];
